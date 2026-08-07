@@ -2,6 +2,9 @@ name: Build
 
 on:
   pull_request:
+    paths:
+      - 'gemini-cli/**'
+      - '.github/workflows/build.yml'
   push:
     tags:
       - 'v*'
@@ -17,6 +20,9 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: gemini-cli
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -24,8 +30,9 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version-file: go.mod
+          go-version-file: gemini-cli/go.mod
           cache: true
+          cache-dependency-path: gemini-cli/go.sum
 
       - name: Test
         run: go test ./...
@@ -64,6 +71,7 @@ jobs:
     defaults:
       run:
         shell: bash
+        working-directory: gemini-cli
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -71,8 +79,9 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version-file: go.mod
+          go-version-file: gemini-cli/go.mod
           cache: true
+          cache-dependency-path: gemini-cli/go.sum
 
       - name: Resolve release metadata
         run: |
@@ -99,7 +108,7 @@ jobs:
       - name: Package plugin
         run: |
           set -euo pipefail
-          go run ./.github/scripts/package-release.go \
+          go run ./tools/package-release \
             -library "dist/${LIB_NAME}" \
             -archive "${ARCHIVE_NAME}" \
             -checksum "${ARCHIVE_NAME}.sha256"
@@ -109,8 +118,8 @@ jobs:
         with:
           name: ${{ env.ARCHIVE_NAME }}
           path: |
-            ${{ env.ARCHIVE_NAME }}
-            ${{ env.ARCHIVE_NAME }}.sha256
+            gemini-cli/${{ env.ARCHIVE_NAME }}
+            gemini-cli/${{ env.ARCHIVE_NAME }}.sha256
           if-no-files-found: error
 
   build-windows-arm64:
@@ -120,6 +129,7 @@ jobs:
     defaults:
       run:
         shell: bash
+        working-directory: gemini-cli
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -127,8 +137,9 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version-file: go.mod
+          go-version-file: gemini-cli/go.mod
           cache: true
+          cache-dependency-path: gemini-cli/go.sum
 
       - name: Resolve release metadata
         id: release_metadata
@@ -149,10 +160,10 @@ jobs:
         env:
           GOFLAGS: -trimpath -buildmode=c-shared
         with:
-          dir: .
+          dir: gemini-cli
           packages: ./cmd/geminicli
           targets: windows-arm64
-          out-dir: dist/windows-arm64
+          out-dir: ${{ github.workspace }}/gemini-cli/dist/windows-arm64
           output: ${{ env.PLUGIN_ID }}.dll
           flags: -ldflags=-s -w
           x-flags: main.pluginVersion=${{ steps.release_metadata.outputs.version }}
@@ -161,7 +172,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -f go-cross-bin.h "dist/windows-arm64/${PLUGIN_ID}.h"
-          go run ./.github/scripts/package-release.go \
+          go run ./tools/package-release \
             -library "dist/windows-arm64/${PLUGIN_ID}.dll" \
             -archive "${ARCHIVE_NAME}" \
             -checksum "${ARCHIVE_NAME}.sha256"
@@ -171,8 +182,8 @@ jobs:
         with:
           name: ${{ env.ARCHIVE_NAME }}
           path: |
-            ${{ env.ARCHIVE_NAME }}
-            ${{ env.ARCHIVE_NAME }}.sha256
+            gemini-cli/${{ env.ARCHIVE_NAME }}
+            gemini-cli/${{ env.ARCHIVE_NAME }}.sha256
           if-no-files-found: error
 
   build-freebsd:
@@ -187,6 +198,7 @@ jobs:
     defaults:
       run:
         shell: bash
+        working-directory: gemini-cli
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -194,8 +206,9 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version-file: go.mod
+          go-version-file: gemini-cli/go.mod
           cache: true
+          cache-dependency-path: gemini-cli/go.sum
 
       - name: Resolve release metadata
         id: release_metadata
@@ -222,10 +235,10 @@ jobs:
         env:
           GOFLAGS: -trimpath -buildmode=c-shared
         with:
-          dir: .
+          dir: gemini-cli
           packages: ./cmd/geminicli
           targets: freebsd-${{ matrix.goarch }}
-          out-dir: dist/freebsd-${{ matrix.goarch }}
+          out-dir: ${{ github.workspace }}/gemini-cli/dist/freebsd-${{ matrix.goarch }}
           output: ${{ env.PLUGIN_ID }}.so
           flags: -ldflags=-s -w
           x-flags: main.pluginVersion=${{ steps.release_metadata.outputs.version }}
@@ -234,7 +247,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -f go-cross-bin.h "dist/freebsd-${{ matrix.goarch }}/${PLUGIN_ID}.h"
-          go run ./.github/scripts/package-release.go \
+          go run ./tools/package-release \
             -library "dist/freebsd-${{ matrix.goarch }}/${PLUGIN_ID}.so" \
             -archive "${ARCHIVE_NAME}" \
             -checksum "${ARCHIVE_NAME}.sha256"
@@ -244,8 +257,8 @@ jobs:
         with:
           name: ${{ env.ARCHIVE_NAME }}
           path: |
-            ${{ env.ARCHIVE_NAME }}
-            ${{ env.ARCHIVE_NAME }}.sha256
+            gemini-cli/${{ env.ARCHIVE_NAME }}
+            gemini-cli/${{ env.ARCHIVE_NAME }}.sha256
           if-no-files-found: error
 
   release:
