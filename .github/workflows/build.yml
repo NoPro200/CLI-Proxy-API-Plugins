@@ -14,7 +14,7 @@ permissions:
   contents: write
 
 env:
-  PLUGIN_ID: gemini-cli
+  PLUGIN_ID: nopro200-gemini-cli
 
 jobs:
   test:
