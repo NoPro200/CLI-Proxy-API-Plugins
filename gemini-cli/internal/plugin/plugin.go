@@ -36,10 +36,10 @@ func Build(configYAML []byte) pluginapi.Plugin {
 	p := New()
 	return pluginapi.Plugin{
 		Metadata: pluginapi.Metadata{
-			Name:             "Gemini CLI Provider",
+			Name:             "Gemini CLI Provider (NoPro200)",
 			Version:          "0.1.0",
-			Author:           "router-for-me",
-			GitHubRepository: "https://github.com/router-for-me/CLIProxyAPIPlugins",
+			Author:           "NoPro200",
+			GitHubRepository: "https://github.com/NoPro200/CLI-Proxy-API-Plugins",
 		},
 		Capabilities: pluginapi.Capabilities{
 			AuthProvider:          p,

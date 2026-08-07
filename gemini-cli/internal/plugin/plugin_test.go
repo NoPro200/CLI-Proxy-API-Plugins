@@ -4,8 +4,14 @@ import "testing"
 
 func TestBuildDeclaresGeminiCLICapabilities(t *testing.T) {
 	plugin := Build(nil)
-	if plugin.Metadata.Name != "Gemini CLI Provider" {
+	if plugin.Metadata.Name != "Gemini CLI Provider (NoPro200)" {
 		t.Fatalf("metadata name = %q", plugin.Metadata.Name)
+	}
+	if plugin.Metadata.Author != "NoPro200" {
+		t.Fatalf("metadata author = %q", plugin.Metadata.Author)
+	}
+	if plugin.Metadata.GitHubRepository != "https://github.com/NoPro200/CLI-Proxy-API-Plugins" {
+		t.Fatalf("metadata repository = %q", plugin.Metadata.GitHubRepository)
 	}
 	if plugin.Capabilities.AuthProvider == nil {
 		t.Fatal("auth provider capability is nil")
