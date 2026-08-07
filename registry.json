@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "gemini-cli",
+      "name": "Gemini CLI Provider",
+      "description": "Gemini CLI upstream provider with OAuth login, fixed or auto-discovered Google Cloud projects, multi-project virtual auths, and OpenAI/Responses/Claude/Gemini/Codex translation.",
+      "author": "NoPro200",
+      "version": "0.1.0",
+      "repository": "https://gitlab.np200.de/cli-proxy-api-plugins/gemini-cli",
+      "homepage": "https://gitlab.np200.de/nopro200/cli-proxy-api-plugins",
+      "license": "MIT",
+      "tags": [
+        "provider",
+        "gemini",
+        "oauth"
+      ]
+    }
+  ]
+}
