@@ -73,6 +73,22 @@ func projectSelectionFromMetadata(metadata map[string]any) projectSelection {
 	}
 }
 
+// withDefaults fills the unset parts of s from the plugin configuration. An
+// explicit selection always wins; the configuration only closes the gaps.
+//
+// Manual mode can be switched on by either source but not off: there is no
+// negative form of --geminicli-manual-projects, so a configured true stands
+// until the configuration itself changes.
+func (s projectSelection) withDefaults(defaults projectSelection) projectSelection {
+	if len(s.IDs) == 0 {
+		s.IDs = defaults.IDs
+	}
+	if !s.Manual {
+		s.Manual = defaults.Manual
+	}
+	return s
+}
+
 func (s projectSelection) validate() error {
 	if s.Manual && len(s.IDs) == 0 {
 		return fmt.Errorf("gemini-cli manual project mode requires a comma-separated project id list")
@@ -97,7 +113,7 @@ func (p *Provider) StartLogin(_ context.Context, req pluginapi.AuthLoginStartReq
 	if redirectURI == "" {
 		return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("gemini-cli oauth redirect URL is empty")
 	}
-	selection := projectSelectionFromMetadata(req.Metadata)
+	selection := projectSelectionFromMetadata(req.Metadata).withDefaults(p.defaults)
 	if errSelection := selection.validate(); errSelection != nil {
 		return pluginapi.AuthLoginStartResponse{}, errSelection
 	}
@@ -189,7 +205,7 @@ func (p *Provider) ExecuteCommandLine(ctx context.Context, req pluginapi.Command
 	selection := projectSelection{
 		Manual: flagBoolValue(req.Flags, "geminicli-manual-projects") || flagBool(req.TriggeredFlags, "geminicli-manual-projects"),
 		IDs:    splitProjectIDList(flagString(req.Flags, "geminicli-project-id")),
-	}
+	}.withDefaults(p.defaults)
 	if selection.Manual && len(selection.IDs) == 0 {
 		selection.IDs = splitProjectIDList(promptManualProjectIDs())
 	}

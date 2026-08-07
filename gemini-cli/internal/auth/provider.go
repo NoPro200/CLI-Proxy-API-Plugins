@@ -17,7 +17,10 @@ const (
 	authFallbackRefreshAfter = 30 * time.Minute
 )
 
-type Provider struct{}
+type Provider struct {
+	// defaults seed logins that arrive without their own project selection.
+	defaults projectSelection
+}
 
 type Storage struct {
 	Type         string         `json:"type,omitempty"`
@@ -33,6 +36,12 @@ type Storage struct {
 }
 
 func NewProvider() *Provider { return &Provider{} }
+
+// NewProviderWithSettings returns a provider whose logins fall back to the
+// plugin-owned configuration when the request carries no project selection.
+func NewProviderWithSettings(settings Settings) *Provider {
+	return &Provider{defaults: settings.defaults()}
+}
 
 func (p *Provider) Identifier() string { return ProviderKey }
 

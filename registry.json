@@ -6,7 +6,7 @@
       "name": "Gemini CLI Provider (NoPro200)",
       "description": "Gemini CLI upstream provider with OAuth login, fixed or auto-discovered Google Cloud projects, multi-project virtual auths, and OpenAI/Responses/Claude/Gemini/Codex translation.",
       "author": "NoPro200",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "repository": "https://github.com/NoPro200/CLI-Proxy-API-Plugins",
       "license": "MIT",
       "tags": [

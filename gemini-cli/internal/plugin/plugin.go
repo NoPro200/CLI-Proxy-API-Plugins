@@ -22,9 +22,13 @@ type GeminiCLIPlugin struct {
 	executor   *executor.Executor
 }
 
-func New() *GeminiCLIPlugin {
+func New() *GeminiCLIPlugin { return NewWithSettings(authpkg.Settings{}) }
+
+// NewWithSettings builds the plugin around the operator's plugin-owned
+// configuration, which seeds logins that arrive without a project selection.
+func NewWithSettings(settings authpkg.Settings) *GeminiCLIPlugin {
 	return &GeminiCLIPlugin{
-		auth:       authpkg.NewProvider(),
+		auth:       authpkg.NewProviderWithSettings(settings),
 		models:     models.NewProvider(),
 		thinking:   thinkingpkg.NewApplier(),
 		translator: translator.NewTranslator(),
@@ -33,13 +37,14 @@ func New() *GeminiCLIPlugin {
 }
 
 func Build(configYAML []byte) pluginapi.Plugin {
-	p := New()
+	p := NewWithSettings(authpkg.ParseSettings(configYAML))
 	return pluginapi.Plugin{
 		Metadata: pluginapi.Metadata{
 			Name:             "Gemini CLI Provider (NoPro200)",
 			Version:          "0.1.0",
 			Author:           "NoPro200",
 			GitHubRepository: "https://github.com/NoPro200/CLI-Proxy-API-Plugins",
+			ConfigFields:     authpkg.ConfigFields(),
 		},
 		Capabilities: pluginapi.Capabilities{
 			AuthProvider:          p,

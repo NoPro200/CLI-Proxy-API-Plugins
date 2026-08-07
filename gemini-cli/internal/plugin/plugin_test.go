@@ -13,6 +13,9 @@ func TestBuildDeclaresGeminiCLICapabilities(t *testing.T) {
 	if plugin.Metadata.GitHubRepository != "https://github.com/NoPro200/CLI-Proxy-API-Plugins" {
 		t.Fatalf("metadata repository = %q", plugin.Metadata.GitHubRepository)
 	}
+	if len(plugin.Metadata.ConfigFields) == 0 {
+		t.Fatal("metadata declares no config fields; management clients cannot render a form")
+	}
 	if plugin.Capabilities.AuthProvider == nil {
 		t.Fatal("auth provider capability is nil")
 	}

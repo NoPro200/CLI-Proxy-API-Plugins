@@ -14,6 +14,26 @@ This plugin adds Gemini CLI upstream provider support to CLIProxyAPI through the
 - Translates OpenAI, Responses, Claude, Gemini, and Codex payloads to the Gemini CLI provider envelope.
 - Applies Gemini CLI thinking config under `request.generationConfig.thinkingConfig`.
 
+## Configuration
+
+The plugin reads its own block under `plugins.configs` in the host `config.yaml`. Both fields are optional and are declared to management clients, so the management UI renders a form for them instead of reporting that the plugin has no visual config fields.
+
+```yaml
+plugins:
+  configs:
+    nopro200-gemini-cli:
+      enabled: true
+      project_id: project-a,project-b
+      manual_projects: true
+```
+
+- `project_id`: default Google Cloud project for new logins. Accepts a comma-separated string or a YAML list. Leave it empty to discover projects automatically.
+- `manual_projects`: uses the fixed `project_id` list instead of discovering projects. It requires `project_id`; starting a login without one fails with the same error as the command-line flag.
+
+These values are defaults only. A login that carries its own project selection, whether from a command-line flag or from Web OAuth login metadata, takes precedence, so the configuration merely saves you from repeating the flags on every login. The one asymmetry: `manual_projects` can be switched on by either source but not off, because there is no negative form of `--geminicli-manual-projects`. To return to automatic discovery, clear the setting in the configuration.
+
+Invalid YAML in the block is ignored and the plugin loads with no defaults rather than refusing to start.
+
 ## Command-Line Flags
 
 - `--geminicli-login`: starts an interactive Gemini CLI login.
