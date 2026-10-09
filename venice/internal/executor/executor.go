@@ -99,7 +99,7 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 		return pluginapi.ExecutorResponse{}, errDo
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		errStatus := statusError{statusCode: resp.StatusCode, op: "venice chat failed", body: resp.Body}
+		errStatus := chatFailure(ctx, req.HTTPClient, "venice chat failed", model, resp.StatusCode, resp.Body)
 		span.Finish(monitor.Result{Success: false, Error: errStatus.Error()})
 		return pluginapi.ExecutorResponse{}, errStatus
 	}
@@ -144,7 +144,7 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 		return pluginapi.ExecutorStreamResponse{}, errDo
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		errStatus := statusError{statusCode: resp.StatusCode, op: "venice chat stream failed", body: readStreamErrorBody(ctx, resp.Chunks)}
+		errStatus := chatFailure(ctx, req.HTTPClient, "venice chat stream failed", model, resp.StatusCode, readStreamErrorBody(ctx, resp.Chunks))
 		span.Finish(monitor.Result{Success: false, Error: errStatus.Error()})
 		return pluginapi.ExecutorStreamResponse{}, errStatus
 	}
@@ -432,10 +432,10 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 		for {
 			select {
 			case <-ctx.Done():
+				// The reader is gone; a send here would block forever.
 				if span != nil {
 					span.Finish(monitor.Result{Success: false, Error: ctx.Err().Error()})
 				}
-				out <- pluginapi.ExecutorStreamChunk{Err: ctx.Err()}
 				return
 			case chunk, ok := <-in:
 				if !ok {
@@ -459,8 +459,12 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 					if span != nil {
 						span.Finish(monitor.Result{Success: false, Error: chunk.Err.Error()})
 					}
-					out <- pluginapi.ExecutorStreamChunk{Err: chunk.Err}
-					continue
+					// An upstream error ends the stream; no stop or usage chunk follows it.
+					select {
+					case out <- pluginapi.ExecutorStreamChunk{Err: chunk.Err}:
+					case <-ctx.Done():
+					}
+					return
 				}
 				for _, line := range strings.Split(string(chunk.Payload), "\n") {
 					event, ok := parseVeniceLine(line)

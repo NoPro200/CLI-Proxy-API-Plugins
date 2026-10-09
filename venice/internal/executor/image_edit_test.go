@@ -177,3 +177,25 @@ func (c *fakeEditClient) Do(_ context.Context, req pluginapi.HTTPRequest) (plugi
 func (c *fakeEditClient) DoStream(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
 	return pluginapi.HTTPStreamResponse{}, nil
 }
+
+func TestChatWithEditModelNamesTheImageRoute(t *testing.T) {
+	_, err := NewExecutor().Execute(context.Background(), pluginapi.ExecutorRequest{
+		Model:       "gpt-image-2-edit",
+		Payload:     []byte(`{"model":"gpt-image-2-edit","messages":[{"role":"user","content":"hi"}]}`),
+		StorageJSON: []byte(editTestStorage),
+		HTTPClient:  chatModelNotFoundClient{fakeEditClient: &fakeEditClient{}},
+	})
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusBadRequest || !strings.Contains(err.Error(), "/v1/images/edits") {
+		t.Fatalf("err = %v, want 400 naming /v1/images/edits", err)
+	}
+}
+
+type chatModelNotFoundClient struct{ *fakeEditClient }
+
+func (c chatModelNotFoundClient) Do(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+	if req.URL == chatURL {
+		return pluginapi.HTTPResponse{StatusCode: http.StatusBadRequest, Body: []byte(`{"error":"modelNotFound"}`)}, nil
+	}
+	return c.fakeEditClient.Do(ctx, req)
+}

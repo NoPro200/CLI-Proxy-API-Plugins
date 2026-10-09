@@ -176,13 +176,20 @@ func convertHTTPChunks(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk)
 		for {
 			select {
 			case <-ctx.Done():
-				out <- pluginapi.ExecutorStreamChunk{Err: ctx.Err()}
+				// The reader is gone; a send here would block forever.
 				return
 			case chunk, ok := <-in:
 				if !ok {
 					return
 				}
-				out <- pluginapi.ExecutorStreamChunk{Payload: compat.UnwrapResponse(chunk.Payload), Err: chunk.Err}
+				select {
+				case out <- pluginapi.ExecutorStreamChunk{Payload: compat.UnwrapResponse(chunk.Payload), Err: chunk.Err}:
+				case <-ctx.Done():
+					return
+				}
+				if chunk.Err != nil {
+					return
+				}
 			}
 		}
 	}()

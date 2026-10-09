@@ -91,6 +91,20 @@ func fetchSpec(ctx context.Context, client pluginapi.HostHTTPClient, kind, model
 	return models.ImageSpec{}, badRequest("%v", errSpec)
 }
 
+// chatFailure names the image route when a chat call used an image or edit
+// model: CLIProxyAPI keeps only its built-in image models off the chat routes,
+// so clients that list every model send plugin image models to chat.
+func chatFailure(ctx context.Context, client pluginapi.HostHTTPClient, op, model string, status int, body []byte) error {
+	if strings.Contains(string(body), "modelNotFound") {
+		for _, route := range []struct{ kind, path string }{{models.ImageKind, "/v1/images/generations"}, {models.EditKind, "/v1/images/edits"}} {
+			if _, errSpec := models.FetchImageSpec(ctx, requireClient(client), route.kind, model); errSpec == nil {
+				return badRequest("%s is an image model, not a chat model; send it to %s", model, route.path)
+			}
+		}
+	}
+	return statusError{statusCode: status, op: op, body: body}
+}
+
 // imageFromResponse turns Venice's raw image bytes into one OpenAI image entry.
 func imageFromResponse(op string, resp pluginapi.HTTPResponse) (map[string]any, error) {
 	contentType := resp.Headers.Get("Content-Type")

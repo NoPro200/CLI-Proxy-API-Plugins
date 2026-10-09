@@ -316,11 +316,15 @@ func handleABIMethod(ctx context.Context, method string, request []byte) ([]byte
 		}
 		req := rpcReq.ExecutorRequest
 		req.HTTPClient = abiHostHTTPClient{callbackID: rpcReq.HostCallbackID}
-		resp, errCall := p.ExecuteStream(ctx, req)
+		// The ABI has no cancel call: a client abort only shows as a failed emit.
+		// Cancelling this context when the pump stops ends the executor and its upstream stream.
+		streamCtx, cancel := context.WithCancel(ctx)
+		resp, errCall := p.ExecuteStream(streamCtx, req)
 		if errCall != nil {
+			cancel()
 			return nil, errCall
 		}
-		streamResp, errMarshal := marshalABIStreamResponse(ctx, rpcReq.StreamID, resp)
+		streamResp, errMarshal := marshalABIStreamResponse(streamCtx, cancel, rpcReq.StreamID, resp)
 		if errMarshal != nil {
 			return nil, errMarshal
 		}
@@ -444,6 +448,15 @@ func (c abiHostHTTPClient) DoStream(ctx context.Context, req pluginapi.HTTPReque
 
 func readHostHTTPStream(ctx context.Context, streamID string, out chan<- pluginapi.HTTPStreamChunk) {
 	defer close(out)
+	// A reader that stopped reading must not keep this goroutine and the host stream alive.
+	send := func(chunk pluginapi.HTTPStreamChunk) bool {
+		select {
+		case out <- chunk:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -454,15 +467,16 @@ func readHostHTTPStream(ctx context.Context, streamID string, out chan<- plugina
 		resp, errRead := callHost[abiHostHTTPStreamReadResponse](pluginabi.MethodHostHTTPStreamRead, abiHostHTTPStreamReadRequest{StreamID: streamID})
 		if errRead != nil {
 			closeHostHTTPStream(streamID)
-			out <- pluginapi.HTTPStreamChunk{Err: errRead}
+			send(pluginapi.HTTPStreamChunk{Err: errRead})
 			return
 		}
 		if resp.Error != "" {
-			out <- pluginapi.HTTPStreamChunk{Err: fmt.Errorf("%s", resp.Error)}
+			send(pluginapi.HTTPStreamChunk{Err: fmt.Errorf("%s", resp.Error)})
 			return
 		}
-		if len(resp.Payload) > 0 {
-			out <- pluginapi.HTTPStreamChunk{Payload: append([]byte(nil), resp.Payload...)}
+		if len(resp.Payload) > 0 && !send(pluginapi.HTTPStreamChunk{Payload: append([]byte(nil), resp.Payload...)}) {
+			closeHostHTTPStream(streamID)
+			return
 		}
 		if resp.Done {
 			return
@@ -474,20 +488,22 @@ func closeHostHTTPStream(streamID string) {
 	_, _ = callHost[abiEmptyResponse](pluginabi.MethodHostHTTPStreamClose, abiHostHTTPStreamCloseRequest{StreamID: streamID})
 }
 
-func marshalABIStreamResponse(ctx context.Context, streamID string, resp pluginapi.ExecutorStreamResponse) (abiExecutorStreamResponse, error) {
+func marshalABIStreamResponse(ctx context.Context, cancel context.CancelFunc, streamID string, resp pluginapi.ExecutorStreamResponse) (abiExecutorStreamResponse, error) {
 	if streamID == "" {
+		defer cancel()
 		chunks := make([]pluginapi.ExecutorStreamChunk, 0)
 		for chunk := range resp.Chunks {
 			chunks = append(chunks, chunk)
 		}
 		return abiExecutorStreamResponse{Headers: resp.Headers, Chunks: chunks}, nil
 	}
-	go pumpABIStream(ctx, streamID, resp.Chunks)
+	go pumpABIStream(ctx, cancel, streamID, resp.Chunks)
 	return abiExecutorStreamResponse{Headers: resp.Headers}, nil
 }
 
-func pumpABIStream(ctx context.Context, streamID string, chunks <-chan pluginapi.ExecutorStreamChunk) {
+func pumpABIStream(ctx context.Context, cancel context.CancelFunc, streamID string, chunks <-chan pluginapi.ExecutorStreamChunk) {
 	errorMessage := ""
+	defer cancel()
 	defer func() {
 		_, _ = callHost[abiEmptyResponse](pluginabi.MethodHostStreamClose, abiHostStreamCloseRequest{StreamID: streamID, Error: errorMessage})
 	}()

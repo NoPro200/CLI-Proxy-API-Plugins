@@ -67,6 +67,20 @@ func (e *Executor) executeImageEdit(ctx context.Context, req pluginapi.ExecutorR
 	if errValidate := validateImageEdit(req.Model, editReq, spec); errValidate != nil {
 		return pluginapi.ExecutorResponse{}, errValidate
 	}
+	for i, image := range editReq.Images {
+		fitted, errFit := fitEditImage(image)
+		if errFit != nil {
+			return pluginapi.ExecutorResponse{}, errFit
+		}
+		editReq.Images[i] = fitted
+	}
+	if editReq.Mask != nil {
+		mask, errFit := fitEditImage(*editReq.Mask)
+		if errFit != nil {
+			return pluginapi.ExecutorResponse{}, errFit
+		}
+		editReq.Mask = &mask
+	}
 	headers := veniceHeaders(*storage, false)
 	headers.Set("Accept", "application/json, text/event-stream")
 	data := make([]map[string]any, 0, 4)

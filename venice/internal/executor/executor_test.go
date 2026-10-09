@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -239,5 +240,29 @@ func TestClientKeyLabelPrefersAlias(t *testing.T) {
 	}
 	if got := clientKeyHash(req); got != sha256Hex("secret-token") {
 		t.Fatalf("clientKeyHash = %q", got)
+	}
+}
+
+func TestStreamEndsWithoutReaderWhenCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	out := openAIStreamChunks(ctx, make(chan pluginapi.HTTPStreamChunk), "m", openAIRequest{})
+	<-out // role chunk
+	cancel()
+	// A send after cancel would block forever once the ABI pump stopped reading.
+	if chunk, ok := <-out; ok {
+		t.Fatalf("chunk after cancel = %#v, want closed stream", chunk)
+	}
+}
+
+func TestStreamEndsAtUpstreamError(t *testing.T) {
+	in := make(chan pluginapi.HTTPStreamChunk, 1)
+	in <- pluginapi.HTTPStreamChunk{Err: errors.New("upstream reset")}
+	close(in)
+	var chunks []pluginapi.ExecutorStreamChunk
+	for chunk := range openAIStreamChunks(context.Background(), in, "m", openAIRequest{}) {
+		chunks = append(chunks, chunk)
+	}
+	if len(chunks) != 2 || chunks[1].Err == nil {
+		t.Fatalf("chunks = %d, last err = %v; want role chunk then the error, nothing after", len(chunks), chunks[len(chunks)-1].Err)
 	}
 }
