@@ -94,6 +94,14 @@ func fetchCatalog(ctx context.Context, client pluginapi.HostHTTPClient) ([]plugi
 		info.MaxCompletionTokens = info.OutputTokenLimit
 		addModel(&out, seen, info)
 	}
+	// Image models serve CLIProxyAPI's /v1/images endpoints; without them the chat models still count.
+	if images, errImages := fetchImageCatalog(ctx, client); errImages == nil {
+		for _, model := range images {
+			if !model.ModelSpec.Offline {
+				addModel(&out, seen, imageModelInfo(model))
+			}
+		}
+	}
 	return out, nil
 }
 

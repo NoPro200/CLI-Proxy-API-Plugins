@@ -2,6 +2,7 @@ package models
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -38,9 +39,53 @@ func TestModelsForAuthUsesSpecNamesAndSkipsUnusableModels(t *testing.T) {
 	}
 }
 
+func TestModelsForAuthAddsImageModelsAndSpecs(t *testing.T) {
+	resp, err := NewProvider().ModelsForAuth(context.Background(), pluginapi.AuthModelRequest{
+		HTTPClient: imageCatalogClient{},
+	})
+	if err != nil {
+		t.Fatalf("ModelsForAuth error: %v", err)
+	}
+	var image *pluginapi.ModelInfo
+	for i := range resp.Models {
+		if resp.Models[i].ID == "flux-2-pro" {
+			image = &resp.Models[i]
+		}
+	}
+	if image == nil || image.Type != ImageModelType || image.DisplayName != "Flux 2 Pro" || hasModel(resp.Models, "retired-image") {
+		t.Fatalf("models = %#v", resp.Models)
+	}
+	spec, err := FetchImageSpec(context.Background(), imageCatalogClient{}, "flux-2-pro")
+	if err != nil {
+		t.Fatalf("FetchImageSpec error: %v", err)
+	}
+	if spec.Steps != 20 || spec.Divisor != 16 || spec.DefaultResolution != "1K" || len(spec.AspectRatios) != 2 || len(spec.Qualities) != 2 {
+		t.Fatalf("spec = %#v", spec)
+	}
+}
+
+type imageCatalogClient struct{}
+
+func (imageCatalogClient) Do(_ context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+	if strings.Contains(req.URL, "type=image") {
+		return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"data":[
+			{"id":"flux-2-pro","model_spec":{"name":"Flux 2 Pro","constraints":{"steps":{"default":20,"max":50},"widthHeightDivisor":16,"aspectRatios":["1:1","16:9"],"defaultResolution":"1K","qualities":["low","high"]}}},
+			{"id":"retired-image","model_spec":{"name":"Retired","offline":true}}
+		]}`)}, nil
+	}
+	return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"data":[{"id":"zai-org-glm-5-2","model_spec":{"name":"GLM 5.2"}}]}`)}, nil
+}
+
+func (imageCatalogClient) DoStream(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
+	return pluginapi.HTTPStreamResponse{}, nil
+}
+
 type specCatalogClient struct{}
 
-func (specCatalogClient) Do(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+func (specCatalogClient) Do(_ context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+	if strings.Contains(req.URL, "type=image") {
+		return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"data":[]}`)}, nil
+	}
 	return pluginapi.HTTPResponse{
 		StatusCode: 200,
 		Body: []byte(`{"data":[

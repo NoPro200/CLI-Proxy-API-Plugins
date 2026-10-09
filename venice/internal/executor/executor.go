@@ -16,6 +16,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	authpkg "github.com/trungking/cpa-plugin-venice/internal/auth"
+	"github.com/trungking/cpa-plugin-venice/internal/models"
 	"github.com/trungking/cpa-plugin-venice/internal/monitor"
 )
 
@@ -67,6 +68,9 @@ func NewExecutor() *Executor { return &Executor{} }
 func (e *Executor) Identifier() string { return authpkg.ProviderKey }
 
 func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+	if req.SourceFormat == models.ImageModelType {
+		return e.executeImage(ctx, req)
+	}
 	storage, errStorage := refreshedStorage(ctx, req)
 	if errStorage != nil {
 		return pluginapi.ExecutorResponse{}, errStorage
@@ -109,6 +113,9 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 }
 
 func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorStreamResponse, error) {
+	if req.SourceFormat == models.ImageModelType {
+		return pluginapi.ExecutorStreamResponse{}, fmt.Errorf("venice image generation does not stream; send stream=false")
+	}
 	storage, errStorage := refreshedStorage(ctx, req)
 	if errStorage != nil {
 		return pluginapi.ExecutorStreamResponse{}, errStorage

@@ -43,8 +43,8 @@ func Build(configYAML []byte) pluginapi.Plugin {
 			ModelProvider:         p,
 			Executor:              p,
 			ExecutorModelScope:    pluginapi.ExecutorModelScopeOAuth, // models come from each account's live catalog
-			ExecutorInputFormats:  []string{executorFormat},
-			ExecutorOutputFormats: []string{executorFormat},
+			ExecutorInputFormats:  []string{executorFormat, models.ImageModelType},
+			ExecutorOutputFormats: []string{executorFormat, models.ImageModelType},
 			CommandLinePlugin:     p,
 			ManagementAPI:         p,
 			QuotaProvider:         p,

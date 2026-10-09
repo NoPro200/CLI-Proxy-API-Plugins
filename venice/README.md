@@ -13,6 +13,7 @@ It is a fork of [trungking/cpa-plugin-venice](https://github.com/trungking/cpa-p
 - Converts Venice newline-delimited response chunks into OpenAI-compatible non-streaming responses.
 - Passes Venice streaming chunks through the host stream path.
 - Lists each account's live Venice model catalog with display names. Offline models and E2EE models, which need client-side encryption, are left out.
+- Generates images with Venice image models through CLIProxyAPI's `/v1/images/generations`.
 - Reports plan, credits and rate limits through the CLIProxyAPI quota API, which the management center shows on its quota and auth file pages (releases after v1.25.6).
 - Exposes Venice account status, quota metadata and a realtime request monitor through CLIProxyAPI plugin management routes.
 
@@ -38,6 +39,23 @@ plugins:
 ```
 
 The plugin reads no further options. For a manual install, place `nopro200-venice.so` (`.dylib` on macOS, `.dll` on Windows) in `plugins/<goos>/<goarch>/`. The host derives the plugin ID from the file name, and the plugin's resource links expect `nopro200-venice`.
+
+## Images
+
+Venice image models are registered with the type `openai-image`, so CLIProxyAPI routes `POST /v1/images/generations` for them to this plugin:
+
+```bash
+curl http://localhost:8317/v1/images/generations \
+  -H "Authorization: Bearer <client-api-key>" -H "Content-Type: application/json" \
+  -d '{"model":"flux-2-pro","prompt":"a red apple on a white table","size":"1536x1024"}'
+```
+
+- `size` sets width and height, rounded down to the model's required multiple; the nearest aspect ratio the model supports is sent along. The default is 1024x1024.
+- `n` (up to 4) makes one Venice request per image. `quality` is passed when the model supports it, `negative_prompt` is passed as is.
+- `moderation: "low"` turns Venice's mature filter off; otherwise it stays on. Paid plans get images without the Venice watermark.
+- Streaming is not supported. Image IDs that CLIProxyAPI serves natively, such as `gpt-image-2` or `grok-imagine-image`, stay with their native providers.
+
+Video models are not exposed: CLIProxyAPI's video endpoints accept only its built-in xAI and Sora models.
 
 ## Command-Line Flags
 
