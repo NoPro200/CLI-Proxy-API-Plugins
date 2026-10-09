@@ -229,7 +229,7 @@ func (p *Provider) saveLogin(ctx context.Context, req pluginapi.ManagementReques
 	if strings.TrimSpace(name) != "" {
 		fileName = loginFileName(name)
 		auth.FileName = fileName
-		auth.ID = strings.TrimSuffix(fileName, ".json")
+		auth.ID = fileName
 	}
 	if state != "" {
 		if !authpkg.CompleteLogin(state, auth) {

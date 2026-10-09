@@ -3,6 +3,8 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
 	"testing"
 	"time"
 
@@ -365,5 +367,27 @@ func (refreshHTTPClient) Do(context.Context, pluginapi.HTTPRequest) (pluginapi.H
 }
 
 func (refreshHTTPClient) DoStream(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
+	return pluginapi.HTTPStreamResponse{}, nil
+}
+
+func TestRefreshAuthReportsRevokedTokenAsUnauthorized(t *testing.T) {
+	_, errRefresh := NewProvider().RefreshAuth(context.Background(), pluginapi.AuthRefreshRequest{
+		AuthID:      "account.json",
+		StorageJSON: []byte(`{"type":"gemini-cli","email":"user@example.com","refresh_token":"revoked"}`),
+		HTTPClient:  invalidGrantHTTPClient{},
+	})
+	var status interface{ StatusCode() int }
+	if !errors.As(errRefresh, &status) || status.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("RefreshAuth error = %v, want status 401", errRefresh)
+	}
+}
+
+type invalidGrantHTTPClient struct{}
+
+func (invalidGrantHTTPClient) Do(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+	return pluginapi.HTTPResponse{StatusCode: http.StatusBadRequest, Body: []byte(`{"error":"invalid_grant","error_description":"Token has been expired or revoked."}`)}, nil
+}
+
+func (invalidGrantHTTPClient) DoStream(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
 	return pluginapi.HTTPStreamResponse{}, nil
 }

@@ -104,9 +104,16 @@ func (p *Provider) StartLogin(_ context.Context, req pluginapi.AuthLoginStartReq
 	if errState != nil {
 		return pluginapi.AuthLoginStartResponse{}, errState
 	}
-	expiresAt := time.Now().Add(loginStateTTL)
+	now := time.Now()
+	expiresAt := now.Add(loginStateTTL)
 	loginSessions.Lock()
-	loginSessions.byState[state] = loginSession{createdAt: time.Now(), expiresAt: expiresAt}
+	// Abandoned logins are never polled again, so drop expired ones here.
+	for key, session := range loginSessions.byState {
+		if now.After(session.expiresAt) {
+			delete(loginSessions.byState, key)
+		}
+	}
+	loginSessions.byState[state] = loginSession{createdAt: now, expiresAt: expiresAt}
 	loginSessions.Unlock()
 
 	return pluginapi.AuthLoginStartResponse{
@@ -154,6 +161,10 @@ func (p *Provider) RefreshAuth(ctx context.Context, req pluginapi.AuthRefreshReq
 		return pluginapi.AuthRefreshResponse{}, errRefresh
 	}
 	auth := AuthData(firstNonEmpty(req.AuthID, defaultFileName(*storage)), *storage)
+	if id := strings.TrimSpace(req.AuthID); id != "" {
+		// Keep the host's ID so the refresh updates the existing auth instead of adding one.
+		auth.ID = id
+	}
 	return pluginapi.AuthRefreshResponse{Auth: auth, NextRefreshAfter: auth.NextRefreshAfter}, nil
 }
 
@@ -194,11 +205,17 @@ func ParseStorage(raw []byte) (*Storage, error) {
 	return &storage, nil
 }
 
+// AuthData builds the auth record for an auth file. Its ID is the file name,
+// because CLIProxyAPI identifies file auths by their name in the flat auth
+// directory; a different ID registered the same file twice.
 func AuthData(id string, storage Storage) pluginapi.AuthData {
 	storage.Type = StorageType
 	fileName := filepath.Base(strings.TrimSpace(id))
 	if fileName == "" || fileName == "." {
 		fileName = defaultFileName(storage)
+	}
+	if !strings.HasSuffix(strings.ToLower(fileName), ".json") {
+		fileName += ".json"
 	}
 	label := storage.Email
 	if label == "" {
@@ -226,7 +243,7 @@ func AuthData(id string, storage Storage) pluginapi.AuthData {
 	}
 	return pluginapi.AuthData{
 		Provider:         ProviderKey,
-		ID:               strings.TrimSuffix(fileName, ".json"),
+		ID:               fileName,
 		FileName:         fileName,
 		Label:            label,
 		Prefix:           storage.Prefix,
@@ -261,12 +278,27 @@ func newLoginState() (string, error) {
 	return "venice-" + base64.RawURLEncoding.EncodeToString(raw[:]), nil
 }
 
+// StatusError is an auth failure with the upstream HTTP status, so the host can
+// tell an expired login (401/403) from a transient outage.
+type StatusError struct {
+	Code    int
+	Message string
+}
+
+func (e StatusError) Error() string { return e.Message }
+
+func (e StatusError) StatusCode() int { return e.Code }
+
+func statusErrorf(code int, format string, args ...any) error {
+	return StatusError{Code: code, Message: fmt.Sprintf(format, args...)}
+}
+
 func RefreshStorage(ctx context.Context, client pluginapi.HostHTTPClient, storage *Storage) error {
 	if storage == nil {
 		return fmt.Errorf("venice auth storage is missing")
 	}
 	if storage.Cookie == "" {
-		return fmt.Errorf("venice __client cookie is missing")
+		return StatusError{Code: http.StatusUnauthorized, Message: "venice __client cookie is missing"}
 	}
 	if freshAuthorization(storage) {
 		if errSession := fetchVeniceUserSession(ctx, client, storage); errSession != nil {
@@ -319,14 +351,14 @@ func clerkClient(ctx context.Context, client pluginapi.HostHTTPClient, storage *
 	}
 	mergeSetCookies(storage, resp.Headers)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", "", fmt.Errorf("clerk client lookup failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(resp.Body)))
+		return "", "", statusErrorf(resp.StatusCode, "clerk client lookup failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(resp.Body)))
 	}
 	var payload clerkClientResponse
 	if errDecode := json.Unmarshal(resp.Body, &payload); errDecode != nil {
 		return "", "", fmt.Errorf("decode clerk client response: %w", errDecode)
 	}
 	if len(payload.Errors) > 0 {
-		return "", "", fmt.Errorf("clerk client error: %s", payload.Errors[0].Message)
+		return "", "", statusErrorf(http.StatusUnauthorized, "clerk client error: %s", payload.Errors[0].Message)
 	}
 	for _, session := range payload.Response.Sessions {
 		if session.ID == payload.Response.LastActiveSessionID || payload.Response.LastActiveSessionID == "" {
@@ -335,7 +367,7 @@ func clerkClient(ctx context.Context, client pluginapi.HostHTTPClient, storage *
 			}
 		}
 	}
-	return "", "", fmt.Errorf("clerk client lookup did not return an active session")
+	return "", "", StatusError{Code: http.StatusUnauthorized, Message: "clerk client lookup did not return an active session; log in to Venice again"}
 }
 
 func clerkToken(ctx context.Context, client pluginapi.HostHTTPClient, storage *Storage, sessionID string, sessionToken string) (string, error) {
@@ -362,7 +394,7 @@ func clerkToken(ctx context.Context, client pluginapi.HostHTTPClient, storage *S
 	}
 	mergeSetCookies(storage, resp.Headers)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("clerk token request failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(resp.Body)))
+		return "", statusErrorf(resp.StatusCode, "clerk token request failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(resp.Body)))
 	}
 	var payload struct {
 		JWT string `json:"jwt"`
@@ -395,7 +427,7 @@ func fetchVeniceUserSession(ctx context.Context, client pluginapi.HostHTTPClient
 		return errDo
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("venice user session failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(resp.Body)))
+		return statusErrorf(resp.StatusCode, "venice user session failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(resp.Body)))
 	}
 	var payload struct {
 		Token string `json:"token"`

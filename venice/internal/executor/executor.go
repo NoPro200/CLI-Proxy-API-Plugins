@@ -99,7 +99,7 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 		return pluginapi.ExecutorResponse{}, errDo
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		errStatus := fmt.Errorf("venice chat failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(resp.Body)))
+		errStatus := statusError{statusCode: resp.StatusCode, op: "venice chat failed", body: resp.Body}
 		span.Finish(monitor.Result{Success: false, Error: errStatus.Error()})
 		return pluginapi.ExecutorResponse{}, errStatus
 	}
@@ -114,7 +114,7 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 
 func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorStreamResponse, error) {
 	if req.SourceFormat == models.ImageModelType {
-		return pluginapi.ExecutorStreamResponse{}, fmt.Errorf("venice image generation does not stream; send stream=false")
+		return pluginapi.ExecutorStreamResponse{}, badRequest("venice images do not stream; send stream=false")
 	}
 	storage, errStorage := refreshedStorage(ctx, req)
 	if errStorage != nil {
@@ -144,7 +144,7 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 		return pluginapi.ExecutorStreamResponse{}, errDo
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		errStatus := fmt.Errorf("venice chat stream failed: status %d", resp.StatusCode)
+		errStatus := statusError{statusCode: resp.StatusCode, op: "venice chat stream failed", body: readStreamErrorBody(ctx, resp.Chunks)}
 		span.Finish(monitor.Result{Success: false, Error: errStatus.Error()})
 		return pluginapi.ExecutorStreamResponse{}, errStatus
 	}
@@ -209,10 +209,10 @@ func buildVeniceRequest(req pluginapi.ExecutorRequest) (openAIRequest, []byte, s
 	}
 	var openReq openAIRequest
 	if errDecode := json.Unmarshal(body, &openReq); errDecode != nil {
-		return openAIRequest{}, nil, "", fmt.Errorf("decode OpenAI request: %w", errDecode)
+		return openAIRequest{}, nil, "", badRequest("decode OpenAI request: %v", errDecode)
 	}
 	if len(openReq.Messages) == 0 {
-		return openAIRequest{}, nil, "", fmt.Errorf("messages must be an array")
+		return openAIRequest{}, nil, "", badRequest("messages must be a non-empty array")
 	}
 	model := firstNonEmpty(req.Model, openReq.Model, "zai-org-glm-5.2")
 	veniceModel := toVeniceWebModelID(model)

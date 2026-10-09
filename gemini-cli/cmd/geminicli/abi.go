@@ -48,6 +48,7 @@ import "C"
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -587,7 +588,8 @@ func abiErrorEnvelopeFromError(code string, err error) []byte {
 		return abiErrorEnvelope(code, "")
 	}
 	httpStatus := 0
-	if statusProvider, ok := err.(interface{ StatusCode() int }); ok && statusProvider != nil {
+	var statusProvider interface{ StatusCode() int }
+	if errors.As(err, &statusProvider) {
 		httpStatus = statusProvider.StatusCode()
 	}
 	return abiErrorEnvelopeWithStatus(code, err.Error(), httpStatus)

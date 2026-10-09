@@ -455,9 +455,7 @@ func (p *Provider) refreshToken(ctx context.Context, client pluginapi.HostHTTPCl
 }
 
 func (p *Provider) tokenRequest(ctx context.Context, client pluginapi.HostHTTPClient, values url.Values) (*oauth2.Token, error) {
-	if client == nil {
-		client = fallbackClient{client: http.DefaultClient}
-	}
+	client = requireHTTPClient(client)
 	resp, errDo := client.Do(ctx, pluginapi.HTTPRequest{
 		Method: http.MethodPost,
 		URL:    tokenURL,
@@ -471,7 +469,12 @@ func (p *Provider) tokenRequest(ctx context.Context, client pluginapi.HostHTTPCl
 		return nil, errDo
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("gemini-cli token request failed: status %d: %s", resp.StatusCode, string(resp.Body))
+		status := resp.StatusCode
+		// A revoked or expired refresh token is a login problem, not a bad request.
+		if status == http.StatusBadRequest && gjson.GetBytes(resp.Body, "error").String() == "invalid_grant" {
+			status = http.StatusUnauthorized
+		}
+		return nil, tokenError{status: status, message: fmt.Sprintf("gemini-cli token request failed: status %d: %s", resp.StatusCode, string(resp.Body))}
 	}
 	var token oauth2.Token
 	if errDecode := json.Unmarshal(resp.Body, &token); errDecode != nil {
@@ -728,8 +731,19 @@ func requireHTTPClient(client pluginapi.HostHTTPClient) pluginapi.HostHTTPClient
 	if client != nil {
 		return client
 	}
-	return fallbackClient{client: http.DefaultClient}
+	return fallbackClient{client: fallbackHTTPClient("")}
 }
+
+// tokenError carries the token endpoint status so the host can tell a needed
+// re-login from an outage.
+type tokenError struct {
+	status  int
+	message string
+}
+
+func (e tokenError) Error() string { return e.message }
+
+func (e tokenError) StatusCode() int { return e.status }
 
 func authedGet(ctx context.Context, client pluginapi.HostHTTPClient, endpoint string, accessToken string) (pluginapi.HTTPResponse, error) {
 	client = requireHTTPClient(client)
@@ -982,7 +996,7 @@ type fallbackClient struct {
 func (c fallbackClient) Do(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
 	client := c.client
 	if client == nil {
-		client = http.DefaultClient
+		client = fallbackHTTPClient("")
 	}
 	httpReq, errRequest := http.NewRequestWithContext(ctx, req.Method, req.URL, bytes.NewReader(req.Body))
 	if errRequest != nil {

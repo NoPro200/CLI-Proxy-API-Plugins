@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -69,6 +70,9 @@ func TestRefreshAuthUsesClientCookieFlow(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("RefreshAuth error: %v", err)
+	}
+	if resp.Auth.ID != "venice-test" || resp.Auth.FileName != "venice-test.json" {
+		t.Fatalf("refreshed auth id/file = %q/%q, want host id kept", resp.Auth.ID, resp.Auth.FileName)
 	}
 	var stored Storage
 	if err := json.Unmarshal(resp.Auth.StorageJSON, &stored); err != nil {
@@ -156,4 +160,33 @@ func base64Raw(raw []byte) string {
 		out.WriteByte(alphabet[(buffer<<(6-bits))&0x3f])
 	}
 	return out.String()
+}
+
+func TestParseAuthUsesHostFileAuthID(t *testing.T) {
+	resp, err := NewProvider().ParseAuth(context.Background(), pluginapi.AuthParseRequest{
+		FileName: "user-example.com-venice.json",
+		RawJSON:  []byte(`{"type":"venice","cookie":"__client=abc","email":"user@example.com"}`),
+	})
+	if err != nil || !resp.Handled {
+		t.Fatalf("ParseAuth = %#v, %v", resp, err)
+	}
+	// CLIProxyAPI's own auth file ID is the file name; any other ID duplicates the auth.
+	if resp.Auth.ID != "user-example.com-venice.json" || resp.Auth.FileName != "user-example.com-venice.json" {
+		t.Fatalf("auth id/file = %q/%q", resp.Auth.ID, resp.Auth.FileName)
+	}
+}
+
+func TestStartLoginDropsExpiredSessions(t *testing.T) {
+	loginSessions.Lock()
+	loginSessions.byState["abandoned"] = loginSession{expiresAt: time.Now().Add(-time.Minute)}
+	loginSessions.Unlock()
+	if _, err := NewProvider().StartLogin(context.Background(), pluginapi.AuthLoginStartRequest{Provider: ProviderKey}); err != nil {
+		t.Fatalf("StartLogin error: %v", err)
+	}
+	loginSessions.Lock()
+	_, stale := loginSessions.byState["abandoned"]
+	loginSessions.Unlock()
+	if stale {
+		t.Fatal("expired login session was kept")
+	}
 }
