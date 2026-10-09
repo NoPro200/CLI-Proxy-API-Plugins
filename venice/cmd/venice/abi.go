@@ -87,6 +87,7 @@ type abiCapabilities struct {
 	ThinkingApplier       bool                         `json:"thinking_applier"`
 	CommandLinePlugin     bool                         `json:"command_line_plugin"`
 	ManagementAPI         bool                         `json:"management_api"`
+	QuotaProvider         bool                         `json:"quota_provider"`
 }
 
 type abiIdentifierResponse struct {
@@ -110,6 +111,11 @@ type abiAuthRefreshRequest struct {
 
 type abiAuthModelRequest struct {
 	pluginapi.AuthModelRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+type abiQuotaFetchRequest struct {
+	pluginapi.QuotaFetchRequest
 	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
@@ -263,8 +269,31 @@ func handleABIMethod(ctx context.Context, method string, request []byte) ([]byte
 	switch method {
 	case pluginabi.MethodAuthIdentifier:
 		return abiOKEnvelope(abiIdentifierResponse{Identifier: authpkg.AuthProviderKey})
-	case pluginabi.MethodExecutorIdentifier, pluginabi.MethodThinkingIdentifier:
+	case pluginabi.MethodExecutorIdentifier, pluginabi.MethodThinkingIdentifier, pluginabi.MethodQuotaIdentifier:
 		return abiOKEnvelope(abiIdentifierResponse{Identifier: p.Identifier()})
+	case pluginabi.MethodQuotaDescribe:
+		var req pluginapi.QuotaDescribeRequest
+		if errDecode := json.Unmarshal(request, &req); errDecode != nil {
+			return nil, errDecode
+		}
+		resp, errCall := p.DescribeQuota(ctx, req)
+		return abiOKEnvelopeWithError(resp, errCall)
+	case pluginabi.MethodQuotaFetch:
+		var rpcReq abiQuotaFetchRequest
+		if errDecode := json.Unmarshal(request, &rpcReq); errDecode != nil {
+			return nil, errDecode
+		}
+		req := rpcReq.QuotaFetchRequest
+		req.HTTPClient = abiHostHTTPClient{callbackID: rpcReq.HostCallbackID}
+		resp, errCall := p.FetchQuota(ctx, req)
+		return abiOKEnvelopeWithError(resp, errCall)
+	case pluginabi.MethodQuotaReset:
+		var req pluginapi.QuotaResetRequest
+		if errDecode := json.Unmarshal(request, &req); errDecode != nil {
+			return nil, errDecode
+		}
+		resp, errCall := p.ResetQuota(ctx, req)
+		return abiOKEnvelopeWithError(resp, errCall)
 	case pluginabi.MethodAuthParse:
 		var req pluginapi.AuthParseRequest
 		if errDecode := json.Unmarshal(request, &req); errDecode != nil {
@@ -442,6 +471,7 @@ func handleRegister(request []byte) ([]byte, error) {
 			ThinkingApplier:       plugin.Capabilities.ThinkingApplier != nil,
 			CommandLinePlugin:     plugin.Capabilities.CommandLinePlugin != nil,
 			ManagementAPI:         plugin.Capabilities.ManagementAPI != nil,
+			QuotaProvider:         plugin.Capabilities.QuotaProvider != nil,
 		},
 	})
 }

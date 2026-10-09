@@ -22,7 +22,7 @@ import (
 
 const (
 	ProviderKey          = "venice"
-	AuthProviderKey      = "cpa-plugin-venice"
+	AuthProviderKey      = "venice"
 	StorageType          = "venice"
 	clerkClientURL       = "https://clerk.venice.ai/v1/client?__clerk_api_version=2026-05-12&_clerk_js_version=6.22.0"
 	veniceUserSessionURL = "https://outerface.venice.ai/api/user/session?bustBalanceCache=true"
@@ -33,7 +33,8 @@ const (
 
 // PluginID must match the library file name (nopro200-venice.<ext>), because
 // the host derives the ID, and with it the resource URLs, from that name.
-// AuthProviderKey stays unchanged so existing logins and auth files keep working.
+// AuthProviderKey is separate: it must equal the provider of the auths this
+// plugin creates, or the host never asks it for their models or refreshes.
 const PluginID = "nopro200-venice"
 
 type Provider struct{}
@@ -165,7 +166,8 @@ func ParseStorage(raw []byte) (*Storage, error) {
 		return nil, fmt.Errorf("decode venice auth: %w", errUnmarshal)
 	}
 	providerType := strings.ToLower(strings.TrimSpace(stringFromMap(decoded, "type")))
-	if providerType != ProviderKey && providerType != AuthProviderKey && providerType != StorageType && providerType != "venice-web" {
+	// cpa-plugin-venice was the upstream auth provider key.
+	if providerType != ProviderKey && providerType != StorageType && providerType != "venice-web" && providerType != "cpa-plugin-venice" {
 		return nil, nil
 	}
 	storage := Storage{
@@ -231,7 +233,7 @@ func AuthData(id string, storage Storage) pluginapi.AuthData {
 		StorageJSON:      storage.RawJSON(),
 		Metadata:         metadata,
 		Attributes:       map[string]string{"email": storage.Email},
-		NextRefreshAfter: NextRefreshAfter(storage, time.Now()),
+		NextRefreshAfter: NextRefreshAfter(time.Now()),
 	}
 }
 
@@ -426,14 +428,9 @@ func fetchVeniceUserSession(ctx context.Context, client pluginapi.HostHTTPClient
 	return nil
 }
 
-func NextRefreshAfter(storage Storage, now time.Time) time.Time {
-	if expiry, ok := parseTime(storage.AuthorizationExpiresAt); ok {
-		refreshAt := expiry.Add(-refreshLead)
-		if refreshAt.After(now) {
-			return refreshAt
-		}
-		return now
-	}
+// NextRefreshAfter paces the host's background refresh, which keeps the quota
+// current. Requests renew the short-lived bearer token themselves (ShouldRefreshStorage).
+func NextRefreshAfter(now time.Time) time.Time {
 	return now.Add(defaultRefreshAfter)
 }
 

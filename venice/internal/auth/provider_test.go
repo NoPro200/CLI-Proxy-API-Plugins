@@ -10,6 +10,20 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
+func TestIdentifierMatchesAuthProvider(t *testing.T) {
+	// The host asks a plugin for models and refreshes only when these match.
+	if got := NewProvider().Identifier(); got != ProviderKey {
+		t.Fatalf("Identifier = %q, want %q", got, ProviderKey)
+	}
+	storage, err := ParseStorage([]byte(`{"type":"cpa-plugin-venice","cookie":"__client=abc"}`))
+	if err != nil || storage == nil {
+		t.Fatalf("legacy auth type not parsed: %#v, %v", storage, err)
+	}
+	if got := AuthData("", *storage).Provider; got != ProviderKey {
+		t.Fatalf("auth provider = %q, want %q", got, ProviderKey)
+	}
+}
+
 func TestNormalizeCookieInputAcceptsCurlCookie(t *testing.T) {
 	input := `curl 'https://clerk.venice.ai/v1/client' -H 'accept: */*' -b '__client=abc; __client_uat=123'`
 	got := NormalizeCookieInput(input)

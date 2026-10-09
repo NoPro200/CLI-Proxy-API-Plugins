@@ -42,11 +42,12 @@ func Build(configYAML []byte) pluginapi.Plugin {
 			AuthProvider:          p,
 			ModelProvider:         p,
 			Executor:              p,
-			ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
+			ExecutorModelScope:    pluginapi.ExecutorModelScopeOAuth, // models come from each account's live catalog
 			ExecutorInputFormats:  []string{executorFormat},
 			ExecutorOutputFormats: []string{executorFormat},
 			CommandLinePlugin:     p,
 			ManagementAPI:         p,
+			QuotaProvider:         p,
 		},
 	}
 }
@@ -125,7 +126,20 @@ func (p *VenicePlugin) HandleManagementWithHost(ctx context.Context, req plugina
 	return p.mgmt.HandleManagementWithHost(ctx, req, host)
 }
 
+func (p *VenicePlugin) DescribeQuota(context.Context, pluginapi.QuotaDescribeRequest) (pluginapi.QuotaDescribeResponse, error) {
+	return pluginapi.QuotaDescribeResponse{SupportedProviders: []string{Provider}, DisplayName: "Venice"}, nil
+}
+
+func (p *VenicePlugin) FetchQuota(ctx context.Context, req pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
+	return p.mgmt.FetchQuota(ctx, req)
+}
+
+func (p *VenicePlugin) ResetQuota(context.Context, pluginapi.QuotaResetRequest) (pluginapi.QuotaResetResponse, error) {
+	return pluginapi.QuotaResetResponse{Message: "Venice quota cannot be reset"}, nil
+}
+
 var _ pluginapi.AuthProvider = (*VenicePlugin)(nil)
+var _ pluginapi.QuotaProvider = (*VenicePlugin)(nil)
 var _ pluginapi.ModelProvider = (*VenicePlugin)(nil)
 var _ pluginapi.ProviderExecutor = (*VenicePlugin)(nil)
 var _ pluginapi.CommandLinePlugin = (*VenicePlugin)(nil)

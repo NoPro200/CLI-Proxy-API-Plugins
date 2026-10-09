@@ -12,7 +12,15 @@ It is a fork of [trungking/cpa-plugin-venice](https://github.com/trungking/cpa-p
 - Executes OpenAI `chat.completions` requests against `https://outerface.venice.ai/api/inference/chat`. The host translates other client protocols.
 - Converts Venice newline-delimited response chunks into OpenAI-compatible non-streaming responses.
 - Passes Venice streaming chunks through the host stream path.
+- Lists each account's live Venice model catalog with display names. Offline models and E2EE models, which need client-side encryption, are left out.
+- Reports plan, credits and rate limits through the CLIProxyAPI quota API, which the management center shows on its quota and auth file pages (releases after v1.25.6).
 - Exposes Venice account status, quota metadata and a realtime request monitor through CLIProxyAPI plugin management routes.
+
+Requires CLIProxyAPI v7.3.4 or newer: the plugin is built with SDK v7.3.20 and declares RPC schema version 6.
+
+## Models
+
+Venice offers models whose IDs other providers also serve, for example `claude-opus-4-8`. CLIProxyAPI then routes such a request to any credential that serves the ID, Venice included. With `routing.strategy: fill-first`, the `priority` field of an auth file decides the order (higher first). Give the Venice auth file a lower `priority` than the other credentials to use Venice only when they are unavailable, or hide models from Venice under `oauth.excluded-models.venice` (`oauth-excluded-models` in the older flat config layout), which accepts wildcards such as `claude-*`.
 
 ## Installation
 
@@ -86,6 +94,8 @@ Browser pages, also listed in the management panel:
 CLIProxyAPI serves `/v0/resource/...` pages without the management key, so these pages carry no account data. They ask for the management key once per browser tab, keep it in `sessionStorage`, and load all data through the management routes. A rejected key is discarded at once, so it counts as a single failed attempt toward the host's IP ban (5 failures, 30 minutes).
 
 The account data includes email, status, request counts, token expiry, plan, quota, and the time the quota was checked. Cookies and bearer tokens are never returned.
+
+The host refreshes each Venice account every 10 minutes, which keeps the quota current. Requests renew the short-lived bearer token on their own.
 
 ## Build
 

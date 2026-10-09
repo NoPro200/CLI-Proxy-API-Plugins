@@ -1,6 +1,10 @@
 package plugin
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+)
 
 func TestBuildReportsForkIdentity(t *testing.T) {
 	plugin := Build(nil)
@@ -15,5 +19,11 @@ func TestBuildReportsForkIdentity(t *testing.T) {
 	}
 	if plugin.Capabilities.ManagementAPI == nil {
 		t.Fatal("management API capability is nil")
+	}
+	if plugin.Capabilities.QuotaProvider == nil || plugin.Capabilities.QuotaProvider.Identifier() != Provider {
+		t.Fatal("quota provider must serve the auth provider key")
+	}
+	if plugin.Capabilities.ExecutorModelScope != pluginapi.ExecutorModelScopeOAuth {
+		t.Fatalf("executor model scope = %q", plugin.Capabilities.ExecutorModelScope)
 	}
 }

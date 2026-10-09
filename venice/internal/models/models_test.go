@@ -22,6 +22,39 @@ func TestModelsForAuthFetchesCatalogIDsOnly(t *testing.T) {
 	}
 }
 
+func TestModelsForAuthUsesSpecNamesAndSkipsUnusableModels(t *testing.T) {
+	resp, err := NewProvider().ModelsForAuth(context.Background(), pluginapi.AuthModelRequest{
+		HTTPClient: specCatalogClient{},
+	})
+	if err != nil {
+		t.Fatalf("ModelsForAuth error: %v", err)
+	}
+	if len(resp.Models) != 1 {
+		t.Fatalf("models = %#v", resp.Models)
+	}
+	model := resp.Models[0]
+	if model.ID != "zai-org-glm-5-2" || model.DisplayName != "GLM 5.2" || model.Type != "chat" || model.OutputTokenLimit != 32_768 {
+		t.Fatalf("model = %#v", model)
+	}
+}
+
+type specCatalogClient struct{}
+
+func (specCatalogClient) Do(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+	return pluginapi.HTTPResponse{
+		StatusCode: 200,
+		Body: []byte(`{"data":[
+			{"id":"zai-org-glm-5-2","type":"text","context_length":1000000,"model_spec":{"name":"GLM 5.2","maxCompletionTokens":32768,"capabilities":{"supportsE2EE":false}}},
+			{"id":"e2ee-glm-5-2-p","type":"text","model_spec":{"name":"GLM 5.2","capabilities":{"supportsE2EE":true}}},
+			{"id":"retired-model","type":"text","model_spec":{"name":"Retired","offline":true}}
+		]}`),
+	}, nil
+}
+
+func (specCatalogClient) DoStream(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
+	return pluginapi.HTTPStreamResponse{}, nil
+}
+
 type fakeCatalogClient struct{}
 
 func (fakeCatalogClient) Do(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {

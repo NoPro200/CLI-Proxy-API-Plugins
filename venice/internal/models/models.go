@@ -30,7 +30,11 @@ type catalogModel struct {
 	InputTokenLimit  int64  `json:"input_token_limit"`
 	OutputTokenLimit int64  `json:"output_token_limit"`
 	ModelSpec        struct {
-		Capabilities map[string]any `json:"capabilities"`
+		Name                string         `json:"name"`
+		Description         string         `json:"description"`
+		MaxCompletionTokens int64          `json:"maxCompletionTokens"`
+		Offline             bool           `json:"offline"`
+		Capabilities        map[string]any `json:"capabilities"`
 	} `json:"model_spec"`
 }
 
@@ -77,13 +81,17 @@ func fetchCatalog(ctx context.Context, client pluginapi.HostHTTPClient) ([]plugi
 	out := make([]pluginapi.ModelInfo, 0, len(payload.Data))
 	seen := make(map[string]bool)
 	for _, model := range payload.Data {
-		info := modelInfo(model.ID, firstNonEmpty(model.DisplayName, model.Name, model.ID), firstPositive(model.ContextLength, model.InputTokenLimit, defaultContext(model.ID)))
+		// E2EE models need client-side encryption, which the web chat executor does not do.
+		if model.ModelSpec.Offline || model.ModelSpec.Capabilities["supportsE2EE"] == true {
+			continue
+		}
+		info := modelInfo(model.ID, firstNonEmpty(model.DisplayName, model.Name, model.ModelSpec.Name, model.ID), firstPositive(model.ContextLength, model.InputTokenLimit, defaultContext(model.ID)))
 		info.Created = model.Created
 		info.Object = firstNonEmpty(model.Object, "model")
 		info.OwnedBy = firstNonEmpty(model.OwnedBy, "venice")
-		info.Description = firstNonEmpty(model.Description, info.Description)
-		info.Type = firstNonEmpty(model.Type, "chat")
-		info.OutputTokenLimit = firstPositive(model.OutputTokenLimit, 65_536)
+		info.Description = firstNonEmpty(model.Description, model.ModelSpec.Description, info.Description)
+		info.OutputTokenLimit = firstPositive(model.OutputTokenLimit, model.ModelSpec.MaxCompletionTokens, 65_536)
+		info.MaxCompletionTokens = info.OutputTokenLimit
 		addModel(&out, seen, info)
 	}
 	return out, nil
