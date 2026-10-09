@@ -14,6 +14,18 @@
         "gemini",
         "oauth"
       ]
+    },
+    {
+      "id": "nopro200-venice",
+      "name": "Venice Provider (NoPro200)",
+      "description": "Venice web-chat upstream via the Clerk __client cookie (subscription instead of API credits), with account, quota and realtime pages. Fork of trungking/cpa-plugin-venice.",
+      "author": "NoPro200",
+      "repository": "https://github.com/NoPro200/CLI-Proxy-API-Plugins",
+      "license": "MIT",
+      "tags": [
+        "provider",
+        "venice"
+      ]
     }
   ]
 }

@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'gemini-cli/**'
+      - 'venice/**'
       - '.github/workflows/build.yml'
   push:
     tags:
@@ -13,16 +14,23 @@ on:
 permissions:
   contents: write
 
-env:
-  PLUGIN_ID: nopro200-gemini-cli
+# The plugin store installs from the repository's latest release, so every v*
+# tag builds all plugins with the tag's version into that one release. Keep the
+# plugin list the same in every job below.
 
 jobs:
   test:
-    name: Test
+    name: Test ${{ matrix.plugin.id }}
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin:
+          - { id: nopro200-gemini-cli, dir: gemini-cli, cmd: ./cmd/geminicli }
+          - { id: nopro200-venice, dir: venice, cmd: ./cmd/venice }
     defaults:
       run:
-        working-directory: gemini-cli
+        working-directory: ${{ matrix.plugin.dir }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -30,9 +38,9 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version-file: gemini-cli/go.mod
+          go-version-file: ${{ matrix.plugin.dir }}/go.mod
           cache: true
-          cache-dependency-path: gemini-cli/go.sum
+          cache-dependency-path: ${{ matrix.plugin.dir }}/go.sum
 
       - name: Test
         run: go test ./...
@@ -41,37 +49,27 @@ jobs:
         run: go vet ./...
 
   build:
-    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    name: Build ${{ matrix.plugin.id }} ${{ matrix.target.goos }}/${{ matrix.target.goarch }}
     needs: test
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.target.runner }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-            runner: ubuntu-24.04
-            ext: so
-          - goos: linux
-            goarch: arm64
-            runner: ubuntu-24.04-arm
-            ext: so
-          - goos: darwin
-            goarch: amd64
-            runner: macos-15-intel
-            ext: dylib
-          - goos: darwin
-            goarch: arm64
-            runner: macos-15
-            ext: dylib
-          - goos: windows
-            goarch: amd64
-            runner: windows-2025
-            ext: dll
+        plugin:
+          - { id: nopro200-gemini-cli, dir: gemini-cli, cmd: ./cmd/geminicli }
+          - { id: nopro200-venice, dir: venice, cmd: ./cmd/venice }
+        target:
+          - { goos: linux, goarch: amd64, runner: ubuntu-24.04, ext: so }
+          - { goos: linux, goarch: arm64, runner: ubuntu-24.04-arm, ext: so }
+          - { goos: darwin, goarch: amd64, runner: macos-15-intel, ext: dylib }
+          - { goos: darwin, goarch: arm64, runner: macos-15, ext: dylib }
+          - { goos: windows, goarch: amd64, runner: windows-2025, ext: dll }
+    env:
+      PLUGIN_ID: ${{ matrix.plugin.id }}
     defaults:
       run:
         shell: bash
-        working-directory: gemini-cli
+        working-directory: ${{ matrix.plugin.dir }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -79,9 +77,9 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version-file: gemini-cli/go.mod
+          go-version-file: ${{ matrix.plugin.dir }}/go.mod
           cache: true
-          cache-dependency-path: gemini-cli/go.sum
+          cache-dependency-path: ${{ matrix.plugin.dir }}/go.sum
 
       - name: Resolve release metadata
         run: |
@@ -92,17 +90,17 @@ jobs:
             VERSION="0.0.0-dev"
           fi
           echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
-          echo "LIB_NAME=${PLUGIN_ID}.${{ matrix.ext }}" >> "${GITHUB_ENV}"
-          echo "ARCHIVE_NAME=${PLUGIN_ID}_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip" >> "${GITHUB_ENV}"
+          echo "LIB_NAME=${PLUGIN_ID}.${{ matrix.target.ext }}" >> "${GITHUB_ENV}"
+          echo "ARCHIVE_NAME=${PLUGIN_ID}_${VERSION}_${{ matrix.target.goos }}_${{ matrix.target.goarch }}.zip" >> "${GITHUB_ENV}"
 
       - name: Build shared library
         run: |
           set -euo pipefail
           mkdir -p dist
-          CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+          CGO_ENABLED=1 GOOS=${{ matrix.target.goos }} GOARCH=${{ matrix.target.goarch }} \
             go build -trimpath -buildmode=c-shared \
               -ldflags "-s -w -X main.pluginVersion=${VERSION}" \
-              -o "dist/${LIB_NAME}" ./cmd/geminicli
+              -o "dist/${LIB_NAME}" ${{ matrix.plugin.cmd }}
           rm -f "dist/${PLUGIN_ID}.h"
 
       - name: Package plugin
@@ -118,18 +116,26 @@ jobs:
         with:
           name: ${{ env.ARCHIVE_NAME }}
           path: |
-            gemini-cli/${{ env.ARCHIVE_NAME }}
-            gemini-cli/${{ env.ARCHIVE_NAME }}.sha256
+            ${{ matrix.plugin.dir }}/${{ env.ARCHIVE_NAME }}
+            ${{ matrix.plugin.dir }}/${{ env.ARCHIVE_NAME }}.sha256
           if-no-files-found: error
 
   build-windows-arm64:
-    name: Build windows/arm64
+    name: Build ${{ matrix.plugin.id }} windows/arm64
     needs: test
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin:
+          - { id: nopro200-gemini-cli, dir: gemini-cli, cmd: ./cmd/geminicli }
+          - { id: nopro200-venice, dir: venice, cmd: ./cmd/venice }
+    env:
+      PLUGIN_ID: ${{ matrix.plugin.id }}
     defaults:
       run:
         shell: bash
-        working-directory: gemini-cli
+        working-directory: ${{ matrix.plugin.dir }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -137,9 +143,9 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version-file: gemini-cli/go.mod
+          go-version-file: ${{ matrix.plugin.dir }}/go.mod
           cache: true
-          cache-dependency-path: gemini-cli/go.sum
+          cache-dependency-path: ${{ matrix.plugin.dir }}/go.sum
 
       - name: Resolve release metadata
         id: release_metadata
@@ -160,10 +166,10 @@ jobs:
         env:
           GOFLAGS: -trimpath -buildmode=c-shared
         with:
-          dir: gemini-cli
-          packages: ./cmd/geminicli
+          dir: ${{ matrix.plugin.dir }}
+          packages: ${{ matrix.plugin.cmd }}
           targets: windows-arm64
-          out-dir: ${{ github.workspace }}/gemini-cli/dist/windows-arm64
+          out-dir: ${{ github.workspace }}/${{ matrix.plugin.dir }}/dist/windows-arm64
           output: ${{ env.PLUGIN_ID }}.dll
           flags: -ldflags=-s -w
           x-flags: main.pluginVersion=${{ steps.release_metadata.outputs.version }}
@@ -182,23 +188,28 @@ jobs:
         with:
           name: ${{ env.ARCHIVE_NAME }}
           path: |
-            gemini-cli/${{ env.ARCHIVE_NAME }}
-            gemini-cli/${{ env.ARCHIVE_NAME }}.sha256
+            ${{ matrix.plugin.dir }}/${{ env.ARCHIVE_NAME }}
+            ${{ matrix.plugin.dir }}/${{ env.ARCHIVE_NAME }}.sha256
           if-no-files-found: error
 
   build-freebsd:
-    name: Build freebsd/${{ matrix.goarch }}
+    name: Build ${{ matrix.plugin.id }} freebsd/${{ matrix.goarch }}
     needs: test
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - goarch: amd64
+        plugin:
+          - { id: nopro200-gemini-cli, dir: gemini-cli, cmd: ./cmd/geminicli }
+          - { id: nopro200-venice, dir: venice, cmd: ./cmd/venice }
+        goarch:
+          - amd64
+    env:
+      PLUGIN_ID: ${{ matrix.plugin.id }}
     defaults:
       run:
         shell: bash
-        working-directory: gemini-cli
+        working-directory: ${{ matrix.plugin.dir }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -206,9 +217,9 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version-file: gemini-cli/go.mod
+          go-version-file: ${{ matrix.plugin.dir }}/go.mod
           cache: true
-          cache-dependency-path: gemini-cli/go.sum
+          cache-dependency-path: ${{ matrix.plugin.dir }}/go.sum
 
       - name: Resolve release metadata
         id: release_metadata
@@ -235,10 +246,10 @@ jobs:
         env:
           GOFLAGS: -trimpath -buildmode=c-shared
         with:
-          dir: gemini-cli
-          packages: ./cmd/geminicli
+          dir: ${{ matrix.plugin.dir }}
+          packages: ${{ matrix.plugin.cmd }}
           targets: freebsd-${{ matrix.goarch }}
-          out-dir: ${{ github.workspace }}/gemini-cli/dist/freebsd-${{ matrix.goarch }}
+          out-dir: ${{ github.workspace }}/${{ matrix.plugin.dir }}/dist/freebsd-${{ matrix.goarch }}
           output: ${{ env.PLUGIN_ID }}.so
           flags: -ldflags=-s -w
           x-flags: main.pluginVersion=${{ steps.release_metadata.outputs.version }}
@@ -257,8 +268,8 @@ jobs:
         with:
           name: ${{ env.ARCHIVE_NAME }}
           path: |
-            gemini-cli/${{ env.ARCHIVE_NAME }}
-            gemini-cli/${{ env.ARCHIVE_NAME }}.sha256
+            ${{ matrix.plugin.dir }}/${{ env.ARCHIVE_NAME }}
+            ${{ matrix.plugin.dir }}/${{ env.ARCHIVE_NAME }}.sha256
           if-no-files-found: error
 
   release:
