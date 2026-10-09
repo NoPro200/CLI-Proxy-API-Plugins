@@ -2,10 +2,13 @@ package executor
 
 import (
 	"bytes"
+	"errors"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -49,5 +52,15 @@ func TestFitEditImageShrinksOnlyOversizedImages(t *testing.T) {
 	small := imageUpload{Name: "small.png", ContentType: "image/png", Data: encode(300, 300, false)}
 	if kept, _ := fitEditImage(small); !bytes.Equal(kept.Data, small.Data) {
 		t.Fatal("image within the limit was re-encoded")
+	}
+}
+
+func TestFitEditImageRejectsDecompressionBombs(t *testing.T) {
+	// A 13-byte GIF that declares 65535x65535 px (4.3 GP) must be refused before decoding.
+	bomb := []byte("GIF89a\xff\xff\xff\xff\x00\x00\x00;")
+	_, err := fitEditImage(imageUpload{Name: "bomb.gif", ContentType: "image/gif", Data: bomb})
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusBadRequest || !strings.Contains(err.Error(), "MP are rejected") {
+		t.Fatalf("err = %v, want 400 from the pixel limit before decoding", err)
 	}
 }

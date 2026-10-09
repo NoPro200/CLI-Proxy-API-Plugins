@@ -16,6 +16,11 @@ import (
 // long side; Venice rejects larger inputs with IMAGE_TOO_LARGE (max 7680×4320).
 const maxEditImageSide = 4320
 
+// maxDecodePixels bounds what fitEditImage decodes. Decoding allocates per
+// declared pixel, so a tiny file claiming huge dimensions could otherwise
+// exhaust the memory of the host process; 60 MP still covers 50 MP cameras.
+const maxDecodePixels = 60_000_000
+
 // fitEditImage shrinks an upload whose long side exceeds what Venice accepts
 // and leaves every other upload untouched.
 // shortcut: EXIF orientation is dropped when an image is shrunk; add rotation if sideways edits show up.
@@ -24,6 +29,9 @@ func fitEditImage(upload imageUpload) (imageUpload, error) {
 	if errConfig != nil || max(config.Width, config.Height) <= maxEditImageSide {
 		// Formats Go cannot read, such as WebP, go to Venice as they are.
 		return upload, nil
+	}
+	if config.Width > maxDecodePixels/max(config.Height, 1) {
+		return imageUpload{}, badRequest("%s is %dx%d px; images above %d MP are rejected, send a smaller one", upload.Name, config.Width, config.Height, maxDecodePixels/1_000_000)
 	}
 	src, _, errDecode := image.Decode(bytes.NewReader(upload.Data))
 	if errDecode != nil {
