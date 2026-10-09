@@ -238,26 +238,35 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y clang lld wget
+          sudo apt-get install -y clang lld
 
+      # go-cross/cgo-actions hardcodes a FreeBSD release the mirror no longer
+      # serves, so the sysroot is fetched here and pinned by its checksum.
+      # shortcut: amd64 only; another goarch needs its own clang target and base.txz hash.
       - name: Build FreeBSD shared library
         timeout-minutes: 45
-        uses: go-cross/cgo-actions@v1
         env:
-          GOFLAGS: -trimpath -buildmode=c-shared
-        with:
-          dir: ${{ matrix.plugin.dir }}
-          packages: ${{ matrix.plugin.cmd }}
-          targets: freebsd-${{ matrix.goarch }}
-          out-dir: ${{ github.workspace }}/${{ matrix.plugin.dir }}/dist/freebsd-${{ matrix.goarch }}
-          output: ${{ env.PLUGIN_ID }}.so
-          flags: -ldflags=-s -w
-          x-flags: main.pluginVersion=${{ steps.release_metadata.outputs.version }}
+          FREEBSD_BASE: 14.4-RELEASE/base.txz
+          FREEBSD_BASE_SHA256: 769f60a6eea2938ad6b7943cfbcc17dfaf7d1f7ba59a32b869a00349302df853
+        run: |
+          set -euo pipefail
+          SYSROOT="${RUNNER_TEMP}/freebsd-sysroot"
+          # After end of life a release moves to the archive, which serves only HTTP.
+          curl -fsSL -o "${RUNNER_TEMP}/base.txz" "https://download.freebsd.org/releases/amd64/${FREEBSD_BASE}" \
+            || curl -fsSL -o "${RUNNER_TEMP}/base.txz" "http://ftp-archive.freebsd.org/pub/FreeBSD-Archive/old-releases/amd64/${FREEBSD_BASE}"
+          echo "${FREEBSD_BASE_SHA256}  ${RUNNER_TEMP}/base.txz" | sha256sum -c -
+          mkdir -p "${SYSROOT}" "dist/freebsd-${{ matrix.goarch }}"
+          sudo tar --warning=no-unknown-keyword -xf "${RUNNER_TEMP}/base.txz" -C "${SYSROOT}"
+          CGO_ENABLED=1 GOOS=freebsd GOARCH=${{ matrix.goarch }} \
+          CC="clang --target=x86_64-unknown-freebsd14.4 --sysroot=${SYSROOT}" CGO_LDFLAGS="-fuse-ld=lld" \
+            go build -trimpath -buildmode=c-shared \
+              -ldflags "-s -w -X main.pluginVersion=${VERSION}" \
+              -o "dist/freebsd-${{ matrix.goarch }}/${PLUGIN_ID}.so" ${{ matrix.plugin.cmd }}
 
       - name: Package plugin
         run: |
           set -euo pipefail
-          rm -f go-cross-bin.h "dist/freebsd-${{ matrix.goarch }}/${PLUGIN_ID}.h"
+          rm -f "dist/freebsd-${{ matrix.goarch }}/${PLUGIN_ID}.h"
           go run ./tools/package-release \
             -library "dist/freebsd-${{ matrix.goarch }}/${PLUGIN_ID}.so" \
             -archive "${ARCHIVE_NAME}" \
