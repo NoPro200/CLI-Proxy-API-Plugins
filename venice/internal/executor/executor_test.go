@@ -84,6 +84,12 @@ func TestBuildVeniceRequestAddsToolInstructions(t *testing.T) {
 	if strings.HasPrefix(last["content"].(string), "/think ") {
 		t.Fatalf("tool-enabled request should not force /think: %#v", last["content"])
 	}
+	if !strings.HasSuffix(last["content"].(string), toolReminder) {
+		t.Fatalf("last message should end with the tool reminder: %#v", last["content"])
+	}
+	if !strings.Contains(systemPrompt, "Never use <tool_call> tags") {
+		t.Fatalf("systemPrompt should forbid native tool tags: %s", systemPrompt)
+	}
 }
 
 func TestOpenAIStreamChunksConvertsVeniceStream(t *testing.T) {
@@ -264,5 +270,126 @@ func TestStreamEndsAtUpstreamError(t *testing.T) {
 	}
 	if len(chunks) != 2 || chunks[1].Err == nil {
 		t.Fatalf("chunks = %d, last err = %v; want role chunk then the error, nothing after", len(chunks), chunks[len(chunks)-1].Err)
+	}
+}
+
+// queuedClient answers each Venice request with the next queued body.
+type queuedClient struct {
+	bodies   []string
+	requests [][]byte
+}
+
+func (c *queuedClient) Do(_ context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+	c.requests = append(c.requests, req.Body)
+	body := c.bodies[0]
+	c.bodies = c.bodies[1:]
+	return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(body)}, nil
+}
+
+func (c *queuedClient) DoStream(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
+	return pluginapi.HTTPStreamResponse{}, errors.New("not used")
+}
+
+const freshStorage = `{"type":"venice","cookie":"__client=x","authorization":"Bearer t","authorization_expires_at":"2099-01-01T00:00:00Z"}`
+
+const toolPayload = `{"model":"m","messages":[{"role":"user","content":"Liste /root"}],"tools":[{"type":"function","function":{"name":"list_files","parameters":{"type":"object"}}}]}`
+
+const cutLeadIn = `{"kind":"content","content":"Ich prüfe zuerst den Ordner:"}`
+
+func TestNeedsToolRepair(t *testing.T) {
+	tools := openAIRequest{Tools: []json.RawMessage{json.RawMessage(`{"type":"function","function":{"name":"list_files"}}`)}}
+	none := tools
+	none.ToolChoice = "none"
+	cases := []struct {
+		name    string
+		req     openAIRequest
+		content string
+		want    bool
+	}{
+		{"empty answer", tools, "", true},
+		{"lead-in with colon", tools, "Ich prüfe zuerst den Ordner:", true},
+		{"bold lead-in", tools, "**Ich prüfe zuerst:**", true},
+		{"final answer", tools, "Fertig, die Datei ist angelegt.", false},
+		{"tool call", tools, `{"tool_calls":[{"name":"list_files","arguments":{}}]}`, false},
+		{"no tools", openAIRequest{}, "", false},
+		{"tool_choice none", none, "", false},
+	}
+	for _, tc := range cases {
+		if got := needsToolRepair(tc.req, tc.content); got != tc.want {
+			t.Errorf("%s: needsToolRepair = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestExecuteRepairsCutToolCall(t *testing.T) {
+	client := &queuedClient{bodies: []string{
+		cutLeadIn,
+		`{"kind":"content","content":"{\"tool_calls\":[{\"name\":\"list_files\",\"arguments\":{\"path\":\"/root\"}}]}"}`,
+	}}
+	resp, err := NewExecutor().Execute(context.Background(), pluginapi.ExecutorRequest{
+		Model: "m", Payload: []byte(toolPayload), StorageJSON: []byte(freshStorage), HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if len(client.requests) != 2 {
+		t.Fatalf("requests = %d, want the answer plus one repair", len(client.requests))
+	}
+	var retry map[string]any
+	if err := json.Unmarshal(client.requests[1], &retry); err != nil {
+		t.Fatalf("decode repair request: %v", err)
+	}
+	prompt := retry["prompt"].([]any)
+	partial := prompt[len(prompt)-2].(map[string]any)
+	last := prompt[len(prompt)-1].(map[string]any)
+	if partial["role"] != "assistant" || partial["content"] != "Ich prüfe zuerst den Ordner:" || !strings.HasPrefix(last["content"].(string), toolRepairPrompt) {
+		t.Fatalf("repair prompt = %#v", prompt)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(resp.Payload, &body); err != nil {
+		t.Fatalf("decode output: %v", err)
+	}
+	choice := body["choices"].([]any)[0].(map[string]any)
+	if choice["finish_reason"] != "tool_calls" {
+		t.Fatalf("choice = %#v, want the repaired tool call", choice)
+	}
+}
+
+func TestExecuteKeepsAnswerWhenRepairFails(t *testing.T) {
+	client := &queuedClient{bodies: []string{cutLeadIn, cutLeadIn}}
+	resp, err := NewExecutor().Execute(context.Background(), pluginapi.ExecutorRequest{
+		Model: "m", Payload: []byte(toolPayload), StorageJSON: []byte(freshStorage), HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if len(client.requests) != 2 {
+		t.Fatalf("requests = %d, want exactly one repair", len(client.requests))
+	}
+	var body map[string]any
+	if err := json.Unmarshal(resp.Payload, &body); err != nil {
+		t.Fatalf("decode output: %v", err)
+	}
+	message := body["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if message["content"] != "Ich prüfe zuerst den Ordner:" {
+		t.Fatalf("content = %#v, want the original answer", message["content"])
+	}
+}
+
+func TestStreamRepairsCutToolCall(t *testing.T) {
+	in := make(chan pluginapi.HTTPStreamChunk, 1)
+	in <- pluginapi.HTTPStreamChunk{Payload: []byte(`{"kind":"meta","completion_id":"upstream-id"}` + "\n")}
+	close(in)
+	req := openAIRequest{Tools: []json.RawMessage{json.RawMessage(`{"type":"function","function":{"name":"list_files"}}`)}}
+	repair := func(context.Context, string) (string, bool) {
+		return `{"tool_calls":[{"name":"list_files","arguments":{}}]}`, true
+	}
+	var frames []string
+	for chunk := range openAIStreamChunksWithMonitor(context.Background(), in, "m", req, nil, repair) {
+		frames = append(frames, string(chunk.Payload))
+	}
+	joined := strings.Join(frames, "")
+	if !strings.Contains(joined, `"finish_reason":"tool_calls"`) || !strings.Contains(joined, `"name":"list_files"`) {
+		t.Fatalf("stream = %s, want the repaired tool call", joined)
 	}
 }

@@ -103,7 +103,13 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 		span.Finish(monitor.Result{Success: false, Error: errStatus.Error()})
 		return pluginapi.ExecutorResponse{}, errStatus
 	}
-	payload := aggregateOpenAIResponse(resp.Body, model, openReq)
+	content, reasoning, upstreamID := collectVeniceText(resp.Body)
+	if needsToolRepair(openReq, content) {
+		if repaired, ok := repairToolCall(ctx, req.HTTPClient, *storage, model, openReq, content); ok {
+			content = repaired
+		}
+	}
+	payload := openAICompletion(content, reasoning, upstreamID, model, openReq)
 	usage := usageFromOpenAIResponse(payload)
 	span.Finish(monitor.Result{Success: true, OutputTokens: usage.OutputTokens, TotalTokens: usage.TotalTokens})
 	return pluginapi.ExecutorResponse{
@@ -148,9 +154,12 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 		span.Finish(monitor.Result{Success: false, Error: errStatus.Error()})
 		return pluginapi.ExecutorStreamResponse{}, errStatus
 	}
+	repair := func(ctx context.Context, partial string) (string, bool) {
+		return repairToolCall(ctx, req.HTTPClient, *storage, model, openReq, partial)
+	}
 	return pluginapi.ExecutorStreamResponse{
 		Headers: http.Header{"Content-Type": []string{"text/event-stream"}},
-		Chunks:  openAIStreamChunksWithMonitor(ctx, resp.Chunks, model, openReq, span),
+		Chunks:  openAIStreamChunksWithMonitor(ctx, resp.Chunks, model, openReq, span, repair),
 	}, nil
 }
 
@@ -216,6 +225,12 @@ func buildVeniceRequest(req pluginapi.ExecutorRequest) (openAIRequest, []byte, s
 	}
 	model := firstNonEmpty(req.Model, openReq.Model, "zai-org-glm-5.2")
 	veniceModel := toVeniceWebModelID(model)
+	raw, errMarshal := buildVeniceBody(openReq, veniceModel)
+	return openReq, raw, veniceModel, errMarshal
+}
+
+// buildVeniceBody turns an OpenAI chat request into a Venice web chat payload.
+func buildVeniceBody(openReq openAIRequest, veniceModel string) ([]byte, error) {
 	systemPrompt, prompt := splitMessages(openReq)
 	temperature := openReq.Temperature
 	if temperature == nil {
@@ -244,8 +259,7 @@ func buildVeniceRequest(req pluginapi.ExecutorRequest) (openAIRequest, []byte, s
 		"webScrapeEnabled":             false,
 		"xSearchEnabled":               false,
 	}
-	raw, errMarshal := json.Marshal(payload)
-	return openReq, raw, veniceModel, errMarshal
+	return json.Marshal(payload)
 }
 
 func splitMessages(req openAIRequest) (string, []map[string]string) {
@@ -273,6 +287,9 @@ func splitMessages(req openAIRequest) (string, []map[string]string) {
 			role = "user"
 		}
 		prompt = append(prompt, map[string]string{"role": role, "content": content})
+	}
+	if len(req.Tools) > 0 && len(prompt) > 0 && prompt[len(prompt)-1]["role"] == "user" {
+		prompt[len(prompt)-1]["content"] += "\n\n" + toolReminder
 	}
 	if instructions := toolInstructions(req); instructions != "" {
 		systemParts = append(systemParts, instructions)
@@ -332,6 +349,13 @@ func formatAssistantToolCalls(calls []openAIToolCall) string {
 	return "Assistant requested these tool calls:\n" + string(raw)
 }
 
+// toolReminder repeats the call format right before the answer: in long contexts
+// GLM falls back to its native <tool_call> syntax, which Venice cuts off unseen.
+const toolReminder = `(Tool reminder: to call a tool, reply with only {"tool_calls":[{"name":"tool_name","arguments":{}}]}. Never use <tool_call> tags.)`
+
+// toolRepairPrompt asks once more for a call that Venice cut off.
+const toolRepairPrompt = "Your tool call did not arrive. Reply now with only the JSON object for the tool call you intended."
+
 func toolInstructions(req openAIRequest) string {
 	if len(req.Tools) == 0 {
 		return ""
@@ -342,6 +366,7 @@ func toolInstructions(req openAIRequest) string {
 When you need a tool, respond with exactly one JSON object and no markdown, no prose, and no surrounding text:
 {"tool_calls":[{"name":"tool_name","arguments":{}}]}
 The "name" must exactly match one available tool name. The "arguments" value must be a JSON object matching that tool schema.
+Never use <tool_call> tags or any other tool-call syntax; such calls are lost.
 After tool results are provided in later messages, answer normally or request another tool with the same JSON format.
 
 Available tools:
@@ -352,6 +377,54 @@ tool_choice:
 }
 
 func aggregateOpenAIResponse(body []byte, model string, req openAIRequest) []byte {
+	content, reasoning, upstreamID := collectVeniceText(body)
+	return openAICompletion(content, reasoning, upstreamID, model, req)
+}
+
+// needsToolRepair spots tool-enabled answers that Venice cut off at a native
+// <tool_call>: nothing at all, or only a lead-in ending in a colon.
+func needsToolRepair(req openAIRequest, content string) bool {
+	if len(req.Tools) == 0 || req.ToolChoice == "none" {
+		return false
+	}
+	if _, ok := parseToolCalls(content); ok {
+		return false
+	}
+	text := strings.TrimRight(strings.TrimSpace(content), "*_ ")
+	return text == "" || strings.HasSuffix(text, ":")
+}
+
+// repairToolCall asks Venice once more for a tool call it cut off and returns the
+// new answer only when it holds a parsable call.
+func repairToolCall(ctx context.Context, client pluginapi.HostHTTPClient, storage authpkg.Storage, model string, req openAIRequest, partial string) (string, bool) {
+	retry := req
+	retry.Messages = append([]openAIMessage(nil), req.Messages...)
+	if strings.TrimSpace(partial) != "" {
+		retry.Messages = append(retry.Messages, openAIMessage{Role: "assistant", Content: partial})
+	}
+	retry.Messages = append(retry.Messages, openAIMessage{Role: "user", Content: toolRepairPrompt})
+	body, errBody := buildVeniceBody(retry, model)
+	if errBody != nil {
+		return "", false
+	}
+	resp, errDo := requireClient(client).Do(ctx, pluginapi.HTTPRequest{
+		Method:  http.MethodPost,
+		URL:     chatURL,
+		Headers: veniceHeaders(storage, false),
+		Body:    body,
+	})
+	if errDo != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", false
+	}
+	content, _, _ := collectVeniceText(resp.Body)
+	if _, ok := parseToolCalls(content); !ok {
+		return "", false
+	}
+	return content, true
+}
+
+// collectVeniceText joins the assistant text of a buffered Venice response.
+func collectVeniceText(body []byte) (string, string, string) {
 	content := strings.Builder{}
 	reasoning := strings.Builder{}
 	upstreamID := "chatcmpl-" + randomID()
@@ -377,18 +450,22 @@ func aggregateOpenAIResponse(body []byte, model string, req openAIRequest) []byt
 		content.WriteString(event.Content)
 		reasoning.WriteString(event.ReasoningContent)
 	}
-	message := map[string]any{"role": "assistant", "content": content.String()}
+	return content.String(), reasoning.String(), upstreamID
+}
+
+func openAICompletion(content, reasoning, upstreamID, model string, req openAIRequest) []byte {
+	message := map[string]any{"role": "assistant", "content": content}
 	finishReason := "stop"
-	if toolCalls, ok := parseToolCalls(content.String()); ok && len(req.Tools) > 0 {
+	if toolCalls, ok := parseToolCalls(content); ok && len(req.Tools) > 0 {
 		message["content"] = nil
 		message["tool_calls"] = toolCalls
 		finishReason = "tool_calls"
 	}
-	if reasoning.Len() > 0 {
-		message["reasoning_content"] = reasoning.String()
+	if reasoning != "" {
+		message["reasoning_content"] = reasoning
 	}
 	promptTokens := estimateRequestTokens(req)
-	completionTokens := estimateTokens(content.String()) + estimateTokens(reasoning.String())
+	completionTokens := estimateTokens(content) + estimateTokens(reasoning)
 	out := map[string]any{
 		"id":      upstreamID,
 		"object":  "chat.completion",
@@ -406,10 +483,11 @@ func aggregateOpenAIResponse(body []byte, model string, req openAIRequest) []byt
 }
 
 func openAIStreamChunks(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk, model string, req openAIRequest) <-chan pluginapi.ExecutorStreamChunk {
-	return openAIStreamChunksWithMonitor(ctx, in, model, req, nil)
+	return openAIStreamChunksWithMonitor(ctx, in, model, req, nil, nil)
 }
 
-func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk, model string, req openAIRequest, span *monitor.Span) <-chan pluginapi.ExecutorStreamChunk {
+// repair, when set, gets one chance to recover a tool call Venice cut off.
+func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk, model string, req openAIRequest, span *monitor.Span, repair func(context.Context, string) (string, bool)) <-chan pluginapi.ExecutorStreamChunk {
 	out := make(chan pluginapi.ExecutorStreamChunk)
 	go func() {
 		defer close(out)
@@ -439,9 +517,15 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 				return
 			case chunk, ok := <-in:
 				if !ok {
+					final := content.String()
+					if repair != nil && needsToolRepair(req, final) {
+						if repaired, okRepair := repair(ctx, final); okRepair {
+							final = repaired
+						}
+					}
 					promptTokens := estimateRequestTokens(req)
-					completionTokens := estimateTokens(content.String()) + estimateTokens(reasoning.String())
-					if len(req.Tools) > 0 && !emitBufferedToolAwareStream(emit, streamID, created, model, req, content.String(), reasoning.String()) {
+					completionTokens := estimateTokens(final) + estimateTokens(reasoning.String())
+					if len(req.Tools) > 0 && !emitBufferedToolAwareStream(emit, streamID, created, model, req, final, reasoning.String()) {
 						return
 					}
 					if len(req.Tools) == 0 && !emit(openAIStreamPayload(streamID, created, model, map[string]any{}, "stop")) {
