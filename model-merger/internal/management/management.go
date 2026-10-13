@@ -28,7 +28,9 @@ type HostClient interface {
 
 // Loopback is the part of the host's HTTP API the management page needs.
 type Loopback interface {
-	ModelIDs(context.Context) (map[string]string, error)
+	HasAccessKey() bool
+	ClientKey(ctx context.Context, managementAuthorization string) (string, error)
+	ModelIDs(ctx context.Context, authorization string) (map[string]string, error)
 	DeleteAuthFile(ctx context.Context, managementAuthorization, name string) error
 }
 
@@ -92,7 +94,7 @@ func (p *Provider) HandleManagementWithHost(ctx context.Context, req pluginapi.M
 		if !wantsJSON(req) {
 			return pageResponse(), nil
 		}
-		return p.list(ctx, host), nil
+		return p.list(ctx, req, host), nil
 	case http.MethodPost:
 		return p.save(ctx, req, host, true), nil
 	case http.MethodPut:
@@ -104,7 +106,7 @@ func (p *Provider) HandleManagementWithHost(ctx context.Context, req pluginapi.M
 	}
 }
 
-func (p *Provider) list(ctx context.Context, host HostClient) pluginapi.ManagementResponse {
+func (p *Provider) list(ctx context.Context, req pluginapi.ManagementRequest, host HostClient) pluginapi.ManagementResponse {
 	if host == nil {
 		return jsonResponse(http.StatusServiceUnavailable, map[string]any{"error": "CLIProxyAPI host callbacks are unavailable"})
 	}
@@ -120,7 +122,7 @@ func (p *Provider) list(ctx context.Context, host HostClient) pluginapi.Manageme
 			"moderation_patterns": authpkg.DefaultModerationPatterns,
 		},
 	}
-	if ids, errIDs := p.modelIDs(ctx); errIDs == nil {
+	if ids, errIDs := p.modelIDs(ctx, req); errIDs == nil {
 		available := make([]string, 0, len(ids))
 		for id, owner := range ids {
 			if owner != authpkg.ProviderKey {
@@ -235,7 +237,7 @@ func (p *Provider) save(ctx context.Context, req pluginapi.ManagementRequest, ho
 	}
 
 	var warnings []string
-	if ids, errIDs := p.modelIDs(ctx); errIDs == nil {
+	if ids, errIDs := p.modelIDs(ctx, req); errIDs == nil {
 		// The host would route the alias to both this plugin and the real
 		// provider, so an alias must not reuse a real model's name.
 		if owner, taken := ids[model.Alias]; taken && owner != authpkg.ProviderKey {
@@ -311,11 +313,24 @@ func managementAuthorization(headers http.Header) string {
 	return ""
 }
 
-func (p *Provider) modelIDs(ctx context.Context) (map[string]string, error) {
+// modelIDs lists the host's models. Without an access key in the plugin config
+// it borrows one of the host's api-keys through the caller's management key.
+func (p *Provider) modelIDs(ctx context.Context, req pluginapi.ManagementRequest) (map[string]string, error) {
 	if p.loopback == nil {
 		return nil, executor.ErrLoopbackUnconfigured
 	}
-	return p.loopback.ModelIDs(ctx)
+	if p.loopback.HasAccessKey() {
+		return p.loopback.ModelIDs(ctx, "")
+	}
+	key, errKey := p.loopback.ClientKey(ctx, managementAuthorization(req.Headers))
+	if errKey != nil {
+		return nil, errKey
+	}
+	authorization := ""
+	if key != "" {
+		authorization = "Bearer " + key
+	}
+	return p.loopback.ModelIDs(ctx, authorization)
 }
 
 func wantsJSON(req pluginapi.ManagementRequest) bool {

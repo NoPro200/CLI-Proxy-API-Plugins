@@ -20,9 +20,9 @@ const (
 	defaultPort = 8317
 )
 
-// Config is the plugin's block under plugins.configs.nopro200-model-merger in
-// CLIProxyAPI's config.yaml. The access key must be one of the host's api-keys;
-// it is only ever sent to the loopback address.
+// Config is the plugin's optional block under plugins.configs.nopro200-model-merger
+// in CLIProxyAPI's config.yaml. Without an access key the plugin forwards each
+// client's own API key to the targets; with one, all targets run under it.
 type Config struct {
 	Port        int    `yaml:"port"`
 	LoopbackURL string `yaml:"loopback-url"`
@@ -30,7 +30,7 @@ type Config struct {
 }
 
 // ParseConfig reads the plugin config; a missing or broken block falls back
-// to the defaults, and the executor then reports the missing access key.
+// to the defaults.
 func ParseConfig(configYAML []byte) Config {
 	var cfg Config
 	_ = yaml.Unmarshal(configYAML, &cfg)
@@ -72,8 +72,8 @@ func Build(configYAML []byte, log executor.LogFunc) pluginapi.Plugin {
 			Author:           "NoPro200",
 			GitHubRepository: "https://github.com/NoPro200/CLI-Proxy-API-Plugins",
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "access-key", Type: pluginapi.ConfigFieldTypeString, Description: "One of the host's api-keys. The plugin calls the targets through http://127.0.0.1:<port>/v1/images/generations with it."},
-				{Name: "port", Type: pluginapi.ConfigFieldTypeInteger, Description: "Port CLIProxyAPI listens on (default 8317)."},
+				{Name: "access-key", Type: pluginapi.ConfigFieldTypeString, Description: "Optional. One of the host's api-keys used for every target call. Empty: each client's own API key is forwarded."},
+				{Name: "port", Type: pluginapi.ConfigFieldTypeInteger, Description: "Optional. Port CLIProxyAPI listens on (default 8317)."},
 				{Name: "loopback-url", Type: pluginapi.ConfigFieldTypeString, Description: "Optional base URL instead of http://127.0.0.1:<port>, e.g. https://127.0.0.1:8317 with TLS."},
 			},
 		},

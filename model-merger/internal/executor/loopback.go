@@ -19,8 +19,8 @@ const HopHeader = "X-Model-Merger-Hop"
 // maxResponseBytes caps a loopback response; several base64 images fit easily.
 const maxResponseBytes = 512 << 20
 
-// ErrLoopbackUnconfigured reports a plugin config without an access key.
-var ErrLoopbackUnconfigured = errors.New("model-merger: set access-key under plugins.configs.nopro200-model-merger in config.yaml")
+// ErrLoopbackUnconfigured reports a loopback without a base URL.
+var ErrLoopbackUnconfigured = errors.New("model-merger: the loopback address of CLIProxyAPI is unknown")
 
 // Loopback calls CLIProxyAPI's own HTTP API. The host's plugin callback
 // host.model.execute refuses gpt-image-* models outside the images routes, so
@@ -40,9 +40,15 @@ func NewLoopback(baseURL, accessKey string) *Loopback {
 	}
 }
 
-// Configured reports whether model calls can authenticate.
+// Configured reports whether the host can be reached.
 func (l *Loopback) Configured() bool {
-	return l != nil && l.BaseURL != "" && l.AccessKey != ""
+	return l != nil && l.BaseURL != ""
+}
+
+// HasAccessKey reports whether the plugin config sets its own key. Without
+// one, the caller's own credentials are forwarded.
+func (l *Loopback) HasAccessKey() bool {
+	return l != nil && l.AccessKey != ""
 }
 
 // Response is a loopback reply; a transport failure leaves Status at 0.
@@ -52,17 +58,17 @@ type Response struct {
 	Body    []byte
 }
 
-// Do sends one request. authorization overrides the access key, so management
-// calls can forward the caller's management key without storing it.
+// Do sends one request. On /v1 routes a configured access key wins over the
+// given credentials; management routes always use the caller's management
+// key. Without any credentials the request goes out bare, which a host
+// without api-keys accepts.
 func (l *Loopback) Do(ctx context.Context, method, path string, body []byte, authorization string, extra http.Header) (Response, error) {
 	if l == nil || l.BaseURL == "" {
 		return Response{}, ErrLoopbackUnconfigured
 	}
-	if authorization == "" {
-		if l.AccessKey == "" {
-			return Response{}, ErrLoopbackUnconfigured
-		}
+	if l.AccessKey != "" && !strings.HasPrefix(path, "/v0/management/") {
 		authorization = "Bearer " + l.AccessKey
+		extra = withoutClientKeys(extra)
 	}
 	var reader io.Reader
 	if body != nil {
@@ -77,7 +83,9 @@ func (l *Loopback) Do(ctx context.Context, method, path string, body []byte, aut
 			req.Header.Add(key, value)
 		}
 	}
-	req.Header.Set("Authorization", authorization)
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -98,10 +106,10 @@ func (l *Loopback) Do(ctx context.Context, method, path string, body []byte, aut
 	return Response{Status: resp.StatusCode, Headers: resp.Header, Body: raw}, nil
 }
 
-// ModelIDs lists the models the access key can use, for target suggestions
-// and to keep an alias from shadowing a real model.
-func (l *Loopback) ModelIDs(ctx context.Context) (map[string]string, error) {
-	resp, errDo := l.Do(ctx, http.MethodGet, "/v1/models", nil, "", nil)
+// ModelIDs lists the models a client key can use, for target suggestions and
+// to keep an alias from shadowing a real model.
+func (l *Loopback) ModelIDs(ctx context.Context, authorization string) (map[string]string, error) {
+	resp, errDo := l.Do(ctx, http.MethodGet, "/v1/models", nil, authorization, nil)
 	if errDo != nil {
 		return nil, errDo
 	}
@@ -124,6 +132,44 @@ func (l *Loopback) ModelIDs(ctx context.Context) (map[string]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// ClientKey reads one of the host's api-keys with the caller's management key,
+// so the management page can list models without a key in the plugin config.
+// It returns "" when the host has no api-keys and accepts any request. The key
+// stays in the plugin and is never sent back to the browser.
+func (l *Loopback) ClientKey(ctx context.Context, managementAuthorization string) (string, error) {
+	if strings.TrimSpace(managementAuthorization) == "" {
+		return "", errors.New("management key is missing")
+	}
+	resp, errDo := l.Do(ctx, http.MethodGet, "/v0/management/api-keys", nil, managementAuthorization, nil)
+	if errDo != nil {
+		return "", errDo
+	}
+	if resp.Status != http.StatusOK {
+		return "", fmt.Errorf("read api-keys: status %d", resp.Status)
+	}
+	var payload struct {
+		Keys []string `json:"api-keys"`
+	}
+	if errDecode := json.Unmarshal(resp.Body, &payload); errDecode != nil {
+		return "", fmt.Errorf("decode api-keys: %w", errDecode)
+	}
+	for _, key := range payload.Keys {
+		if key = strings.TrimSpace(key); key != "" {
+			return key, nil
+		}
+	}
+	return "", nil
+}
+
+// withoutClientKeys drops forwarded client keys when the access key is used.
+func withoutClientKeys(headers http.Header) http.Header {
+	out := headers.Clone()
+	for _, name := range clientKeyHeaders {
+		out.Del(name)
+	}
+	return out
 }
 
 // DeleteAuthFile removes an auth file through the host's management API. The

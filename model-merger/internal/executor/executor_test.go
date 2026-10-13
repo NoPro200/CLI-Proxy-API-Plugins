@@ -25,6 +25,7 @@ type fakeHost struct {
 	replies map[string]func(w http.ResponseWriter)
 	calls   []map[string]any
 	auth    []string
+	apiKeys []string
 	hops    []string
 }
 
@@ -41,6 +42,7 @@ func newFakeHost(t *testing.T) (*fakeHost, *httptest.Server) {
 		host.mu.Lock()
 		host.calls = append(host.calls, body)
 		host.auth = append(host.auth, r.Header.Get("Authorization"))
+		host.apiKeys = append(host.apiKeys, r.Header.Get("X-Api-Key"))
 		host.hops = append(host.hops, r.Header.Get(HopHeader))
 		reply := host.replies[body["model"].(string)]
 		host.mu.Unlock()
@@ -333,9 +335,9 @@ func TestLoopAndMisuseGuards(t *testing.T) {
 		t.Fatal("a disabled model answered")
 	}
 
-	unconfigured := NewExecutor(NewLoopback(srv.URL, ""), authpkg.NewRegistry(), nil)
-	if _, err := unconfigured.Execute(context.Background(), imageRequest(virtualModel(t, ""))); err == nil || !strings.Contains(err.Error(), "access-key") {
-		t.Fatalf("missing access key: %v", err)
+	unreachable := NewExecutor(NewLoopback("", ""), authpkg.NewRegistry(), nil)
+	if _, err := unreachable.Execute(context.Background(), imageRequest(virtualModel(t, ""))); err == nil || !strings.Contains(err.Error(), "loopback") {
+		t.Fatalf("missing loopback address: %v", err)
 	}
 }
 
@@ -353,5 +355,52 @@ func TestClientCancelStopsTheChain(t *testing.T) {
 	}
 	if got := host.models(); len(got) != 1 {
 		t.Fatalf("calls = %v", got)
+	}
+}
+
+func TestClientCredentialsAreForwardedWithoutAccessKey(t *testing.T) {
+	host, srv := newFakeHost(t)
+	host.replies["gpt-image-2.5-sunburst"] = reply(http.StatusBadGateway, `{"error":{"message":"down"}}`)
+	host.replies["qwen-image-3-pro"] = imageReply("fallback")
+	executor := NewExecutor(NewLoopback(srv.URL, ""), authpkg.NewRegistry(), nil)
+
+	req := imageRequest(virtualModel(t, ""))
+	req.Headers.Set("Authorization", "Bearer sk-client")
+	req.Headers.Set("X-Api-Key", "sk-anthropic-style")
+	if _, err := executor.Execute(context.Background(), req); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	// Every target, the fallback included, runs under the client's own key.
+	for i := range host.auth {
+		if host.auth[i] != "Bearer sk-client" || host.apiKeys[i] != "sk-anthropic-style" {
+			t.Fatalf("call %d: auth=%q x-api-key=%q", i, host.auth[i], host.apiKeys[i])
+		}
+	}
+
+	host.auth, host.apiKeys = nil, nil
+	host.replies["gpt-image-2.5-sunburst"] = imageReply("primary")
+	query := imageRequest(virtualModel(t, ""))
+	query.Query = map[string][]string{"key": {"sk-from-query"}}
+	if _, err := executor.Execute(context.Background(), query); err != nil || host.auth[0] != "Bearer sk-from-query" {
+		t.Fatalf("query key: err=%v auth=%v", err, host.auth)
+	}
+
+	host.auth = nil
+	if _, err := executor.Execute(context.Background(), imageRequest(virtualModel(t, ""))); err != nil || host.auth[0] != "" {
+		t.Fatalf("no key: err=%v auth=%v", err, host.auth)
+	}
+}
+
+func TestAccessKeyReplacesClientCredentials(t *testing.T) {
+	host, srv := newFakeHost(t)
+	host.replies["gpt-image-2.5-sunburst"] = imageReply("primary")
+	req := imageRequest(virtualModel(t, ""))
+	req.Headers.Set("Authorization", "Bearer sk-client")
+	req.Headers.Set("X-Api-Key", "sk-anthropic-style")
+	if _, err := newTestExecutor(srv).Execute(context.Background(), req); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if host.auth[0] != "Bearer test-access-key" || host.apiKeys[0] != "" {
+		t.Fatalf("auth=%q x-api-key=%q", host.auth[0], host.apiKeys[0])
 	}
 }

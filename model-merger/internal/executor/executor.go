@@ -117,12 +117,13 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 		return pluginapi.ExecutorResponse{}, badRequest("model-merger: request body must be a JSON object")
 	}
 
+	authorization, credentials := clientCredentials(req)
 	var last attempt
 	for i, target := range e.plan(model) {
 		if e.registry != nil && e.registry.IsAlias(target.Model) {
 			return pluginapi.ExecutorResponse{}, newStatusError(http.StatusInternalServerError, "config_error", fmt.Sprintf("model-merger: target %s of %s is a virtual model", target.Model, model.Alias))
 		}
-		last = e.try(ctx, model.Alias, target, request)
+		last = e.try(ctx, model.Alias, target, request, authorization, credentials)
 		if last.ok() {
 			e.cooldowns.clear(model.Alias, target.Model)
 			if i > 0 {
@@ -165,9 +166,35 @@ func (e *Executor) plan(model authpkg.VirtualModel) []authpkg.Target {
 	return out
 }
 
+// clientKeyHeaders are the headers besides Authorization in which CLIProxyAPI
+// accepts a client API key.
+var clientKeyHeaders = []string{"X-Api-Key", "X-Goog-Api-Key"}
+
+// clientCredentials returns the caller's own API key in the forms CLIProxyAPI
+// accepts, so every target runs under the key the client used. A key sent as
+// ?key= or ?auth_token= is forwarded as a bearer token.
+func clientCredentials(req pluginapi.ExecutorRequest) (string, http.Header) {
+	authorization := strings.TrimSpace(req.Headers.Get("Authorization"))
+	extra := http.Header{}
+	for _, name := range clientKeyHeaders {
+		if value := strings.TrimSpace(req.Headers.Get(name)); value != "" {
+			extra.Set(name, value)
+		}
+	}
+	if authorization == "" {
+		for _, name := range []string{"key", "auth_token"} {
+			if value := strings.TrimSpace(req.Query.Get(name)); value != "" {
+				authorization = "Bearer " + value
+				break
+			}
+		}
+	}
+	return authorization, extra
+}
+
 // try sends the client's request unchanged except for the model name. The
 // prompt is never rewritten: each target applies its own rules.
-func (e *Executor) try(ctx context.Context, alias string, target authpkg.Target, request map[string]json.RawMessage) attempt {
+func (e *Executor) try(ctx context.Context, alias string, target authpkg.Target, request map[string]json.RawMessage, authorization string, credentials http.Header) attempt {
 	result := attempt{target: target.Model}
 	body := make(map[string]json.RawMessage, len(request))
 	for key, value := range request {
@@ -186,7 +213,9 @@ func (e *Executor) try(ctx context.Context, alias string, target authpkg.Target,
 		callCtx, cancel = context.WithTimeout(ctx, result.timeoutAfter)
 		defer cancel()
 	}
-	resp, errDo := e.loopback.Do(callCtx, http.MethodPost, imagesPath, raw, "", http.Header{HopHeader: []string{alias}})
+	headers := credentials.Clone()
+	headers.Set(HopHeader, alias)
+	resp, errDo := e.loopback.Do(callCtx, http.MethodPost, imagesPath, raw, authorization, headers)
 	if errDo != nil {
 		if errors.Is(callCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
 			result.timeout = true
