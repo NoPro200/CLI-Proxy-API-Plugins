@@ -26,6 +26,19 @@
         "provider",
         "venice"
       ]
+    },
+    {
+      "id": "nopro200-model-merger",
+      "name": "Model Merger (NoPro200)",
+      "description": "Virtuelle Modelle, die Anfragen der Reihe nach an mehrere echte Modelle weiterleiten (Fallback), mit eigener Verwaltungsseite.",
+      "author": "NoPro200",
+      "repository": "https://github.com/NoPro200/CLI-Proxy-API-Plugins",
+      "license": "MIT",
+      "tags": [
+        "router",
+        "fallback",
+        "images"
+      ]
     }
   ]
 }
