@@ -46,7 +46,7 @@ func (e *Executor) executeImage(ctx context.Context, req pluginapi.ExecutorReque
 		return pluginapi.ExecutorResponse{}, errStorage
 	}
 	client := requireClient(req.HTTPClient)
-	spec, errSpec := fetchSpec(ctx, client, models.ImageKind, req.Model)
+	spec, errSpec := fetchSpec(ctx, client, req.Model)
 	if errSpec != nil {
 		return pluginapi.ExecutorResponse{}, errSpec
 	}
@@ -74,19 +74,15 @@ func (e *Executor) executeImage(ctx context.Context, req pluginapi.ExecutorReque
 	return imagesResponse(data)
 }
 
-// fetchSpec loads the model limits and turns a model sent to the wrong
-// endpoint into a client error that names the right one.
-func fetchSpec(ctx context.Context, client pluginapi.HostHTTPClient, kind, model string) (models.ImageSpec, error) {
-	spec, errSpec := models.FetchImageSpec(ctx, client, kind, model)
+// fetchSpec loads the generation limits and turns an edit-only model sent to
+// generations into a client error that names /v1/images/edits.
+func fetchSpec(ctx context.Context, client pluginapi.HostHTTPClient, model string) (models.ImageSpec, error) {
+	spec, errSpec := models.FetchImageSpec(ctx, client, models.ImageKind, model)
 	if !errors.Is(errSpec, models.ErrModelNotFound) {
 		return spec, errSpec
 	}
-	other, hint := models.EditKind, "edits images; send it to /v1/images/edits with an image"
-	if kind == models.EditKind {
-		other, hint = models.ImageKind, "generates images; use its -edit model for /v1/images/edits"
-	}
-	if _, errOther := models.FetchImageSpec(ctx, client, other, model); errOther == nil {
-		return models.ImageSpec{}, badRequest("%s %s", model, hint)
+	if _, errEdit := models.FetchImageSpec(ctx, client, models.EditKind, model); errEdit == nil {
+		return models.ImageSpec{}, badRequest("%s only edits images; send it to /v1/images/edits with an image", model)
 	}
 	return models.ImageSpec{}, badRequest("%v", errSpec)
 }

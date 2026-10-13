@@ -56,14 +56,22 @@ func TestModelsForAuthAddsImageModelsAndSpecs(t *testing.T) {
 	if image == nil || image.Type != ImageModelType || image.DisplayName != "Flux 2 Pro" || hasModel(resp.Models, "retired-image") {
 		t.Fatalf("models = %#v", resp.Models)
 	}
-	var edit *pluginapi.ModelInfo
-	for i := range resp.Models {
-		if resp.Models[i].ID == "flux-2-max-edit" {
-			edit = &resp.Models[i]
-		}
+	methods := map[string]string{}
+	for _, model := range resp.Models {
+		methods[model.ID] = strings.Join(model.SupportedGenerationMethods, ",")
 	}
-	if edit == nil || edit.Type != ImageModelType || edit.DisplayName != "Flux 2 Max Edit" || len(edit.SupportedGenerationMethods) != 1 || edit.SupportedGenerationMethods[0] != "images.edits" {
-		t.Fatalf("edit model = %#v", edit)
+	// Paired edit models are reached through their image model; only edit models without one keep an entry.
+	for id, want := range map[string]string{
+		"flux-2-pro":         "images.generations",
+		"flux-2-max":         "images.generations,images.edits",
+		"grok-imagine-image": "images.generations,images.edits",
+		"firered-image-edit": "images.edits",
+		"flux-2-max-edit":    "",
+		"grok-imagine-edit":  "",
+	} {
+		if methods[id] != want {
+			t.Errorf("%s methods = %q, want %q", id, methods[id], want)
+		}
 	}
 	spec, err := FetchImageSpec(context.Background(), imageCatalogClient{}, ImageKind, "flux-2-pro")
 	if err != nil {
@@ -86,13 +94,17 @@ type imageCatalogClient struct{}
 func (imageCatalogClient) Do(_ context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
 	if strings.Contains(req.URL, "type=inpaint") {
 		return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"data":[
-			{"id":"flux-2-max-edit","type":"inpaint","model_spec":{"name":"Flux 2 Max","constraints":{"aspectRatios":["auto","1:1"],"combineImages":true,"maxInputImages":6,"promptCharacterLimit":3000}}}
+			{"id":"flux-2-max-edit","type":"inpaint","model_spec":{"name":"Flux 2 Max","constraints":{"aspectRatios":["auto","1:1"],"combineImages":true,"maxInputImages":6,"promptCharacterLimit":3000}}},
+			{"id":"grok-imagine-edit","type":"inpaint","model_spec":{"name":"Grok Imagine","constraints":{"promptCharacterLimit":7500}}},
+			{"id":"firered-image-edit","type":"inpaint","model_spec":{"name":"FireRed","constraints":{"promptCharacterLimit":1500}}}
 		]}`)}, nil
 	}
 	if strings.Contains(req.URL, "type=image") {
 		return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"data":[
 			{"id":"flux-2-pro","model_spec":{"name":"Flux 2 Pro","constraints":{"steps":{"default":20,"max":50},"widthHeightDivisor":16,"aspectRatios":["1:1","16:9"],"defaultResolution":"1K","qualities":["low","high"]}}},
-			{"id":"retired-image","model_spec":{"name":"Retired","offline":true}}
+			{"id":"retired-image","model_spec":{"name":"Retired","offline":true}},
+			{"id":"flux-2-max","model_spec":{"name":"Flux 2 Max"}},
+			{"id":"grok-imagine-image","model_spec":{"name":"Grok Imagine"}}
 		]}`)}, nil
 	}
 	return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"data":[{"id":"zai-org-glm-5-2","model_spec":{"name":"GLM 5.2"}}]}`)}, nil
@@ -142,4 +154,42 @@ func hasModel(models []pluginapi.ModelInfo, id string) bool {
 		}
 	}
 	return false
+}
+
+func TestResolveEditFindsTheEditModelBehindListedModels(t *testing.T) {
+	ctx := context.Background()
+	for model, want := range map[string]string{
+		"flux-2-max":         "flux-2-max-edit",    // "-edit" sibling
+		"grok-imagine-image": "grok-imagine-edit",  // same display name
+		"firered-image-edit": "firered-image-edit", // edit model without an image model
+	} {
+		got, spec, err := ResolveEdit(ctx, imageCatalogClient{}, model)
+		if err != nil || got != want {
+			t.Errorf("ResolveEdit(%s) = %q, %v; want %q", model, got, err, want)
+		}
+		if model == "flux-2-max" && (spec.MaxInputImages != 6 || spec.PromptLimit != 3000) {
+			t.Errorf("flux-2-max edit spec = %#v", spec)
+		}
+	}
+	if _, _, err := ResolveEdit(ctx, imageCatalogClient{}, "flux-2-pro"); !errors.Is(err, ErrNoEditModel) {
+		t.Errorf("flux-2-pro err = %v, want ErrNoEditModel", err)
+	}
+	if _, _, err := ResolveEdit(ctx, imageCatalogClient{}, "nope"); !errors.Is(err, ErrModelNotFound) {
+		t.Errorf("unknown model err = %v, want ErrModelNotFound", err)
+	}
+}
+
+func TestEditPartnersGiveEachEditModelOneImageModel(t *testing.T) {
+	model := func(id, name string) imageCatalogModel {
+		m := imageCatalogModel{ID: id}
+		m.ModelSpec.Name = name
+		return m
+	}
+	gens := []imageCatalogModel{model("x", "Bar"), model("y", "Foo"), model("z", "Quality (SOTA)"), model("a", "Twin"), model("b", "Twin")}
+	edits := []imageCatalogModel{model("x-edit", "Foo"), model("z-edit-q", "Quality"), model("t-edit", "Twin")}
+	got := editPartners(gens, edits)
+	// x-edit belongs to x by ID, so y must not claim it by name; ambiguous names pair nothing.
+	if len(got) != 2 || got["x"] != "x-edit" || got["z"] != "z-edit-q" {
+		t.Fatalf("partners = %v", got)
+	}
 }

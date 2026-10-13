@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -21,6 +22,9 @@ const (
 
 // ErrModelNotFound reports that a model is missing from the requested catalog.
 var ErrModelNotFound = errors.New("venice image model not found")
+
+// ErrNoEditModel reports an image model that Venice offers no edit model for.
+var ErrNoEditModel = errors.New("venice image model has no edit model")
 
 type imageCatalogModel struct {
 	ID        string `json:"id"`
@@ -66,22 +70,132 @@ func FetchImageSpec(ctx context.Context, client pluginapi.HostHTTPClient, kind, 
 		return ImageSpec{}, err
 	}
 	for _, model := range catalog {
-		if model.ID != modelID {
-			continue
+		if model.ID == modelID {
+			return specFrom(model), nil
 		}
-		constraints := model.ModelSpec.Constraints
-		return ImageSpec{
-			Steps:             constraints.Steps.Default,
-			Divisor:           constraints.WidthHeightDivisor,
-			AspectRatios:      constraints.AspectRatios,
-			DefaultResolution: constraints.DefaultResolution,
-			Qualities:         constraints.Qualities,
-			MaxInputImages:    constraints.MaxInputImages,
-			CombineImages:     constraints.CombineImages,
-			PromptLimit:       constraints.PromptCharacterLimit,
-		}, nil
 	}
 	return ImageSpec{}, fmt.Errorf("%w: %q", ErrModelNotFound, modelID)
+}
+
+// ResolveEdit finds the Venice edit model behind a listed model, because the
+// plugin lists each edit model under the image model it belongs to. Edit
+// models without one are listed, and resolve, under their own ID.
+func ResolveEdit(ctx context.Context, client pluginapi.HostHTTPClient, modelID string) (string, ImageSpec, error) {
+	editCatalog, err := fetchImageCatalog(ctx, client, EditKind)
+	if err != nil {
+		return "", ImageSpec{}, err
+	}
+	edits := online(editCatalog)
+	byID := make(map[string]imageCatalogModel, len(edits))
+	for _, model := range edits {
+		byID[model.ID] = model
+	}
+	for _, id := range []string{modelID, modelID + "-edit"} {
+		if model, ok := byID[id]; ok {
+			return id, specFrom(model), nil
+		}
+	}
+	genCatalog, err := fetchImageCatalog(ctx, client, ImageKind)
+	if err != nil {
+		return "", ImageSpec{}, err
+	}
+	gens := online(genCatalog)
+	if id := editPartners(gens, edits)[modelID]; id != "" {
+		return id, specFrom(byID[id]), nil
+	}
+	for _, model := range gens {
+		if model.ID == modelID {
+			return "", ImageSpec{}, fmt.Errorf("%w: %q", ErrNoEditModel, modelID)
+		}
+	}
+	return "", ImageSpec{}, fmt.Errorf("%w: %q", ErrModelNotFound, modelID)
+}
+
+// editPartners maps image model IDs to their edit model: the "-edit" sibling,
+// else the only unclaimed edit model with the same display name (Venice names
+// a few pairs differently, such as grok-imagine-image and grok-imagine-edit).
+func editPartners(gens, edits []imageCatalogModel) map[string]string {
+	partners := make(map[string]string)
+	claimed := make(map[string]bool)
+	editIDs := make(map[string]bool, len(edits))
+	for _, model := range edits {
+		editIDs[model.ID] = true
+	}
+	for _, model := range gens {
+		if editIDs[model.ID+"-edit"] {
+			partners[model.ID] = model.ID + "-edit"
+			claimed[model.ID+"-edit"] = true
+		}
+	}
+	editsByName := make(map[string][]string)
+	for _, model := range edits {
+		if name := baseName(model); name != "" && !claimed[model.ID] {
+			editsByName[name] = append(editsByName[name], model.ID)
+		}
+	}
+	gensByName := make(map[string]int)
+	for _, model := range gens {
+		gensByName[baseName(model)]++
+	}
+	for _, model := range gens {
+		name := baseName(model)
+		if ids := editsByName[name]; partners[model.ID] == "" && name != "" && len(ids) == 1 && gensByName[name] == 1 {
+			partners[model.ID] = ids[0]
+		}
+	}
+	return partners
+}
+
+// addImageModels lists each image model once, with editing when it has an
+// edit model, and gives only edit models without one an entry of their own.
+func addImageModels(out *[]pluginapi.ModelInfo, seen map[string]bool, gens, edits []imageCatalogModel) {
+	gens, edits = online(gens), online(edits)
+	partners := editPartners(gens, edits)
+	paired := make(map[string]bool, len(partners))
+	for _, model := range gens {
+		info := imageModelInfo(model, ImageKind)
+		if editID := partners[model.ID]; editID != "" {
+			info.SupportedGenerationMethods = append(info.SupportedGenerationMethods, "images.edits")
+			info.SupportedInputModalities = []string{"text", "image"}
+			paired[editID] = true
+		}
+		addModel(out, seen, info)
+	}
+	for _, model := range edits {
+		if !paired[model.ID] {
+			addModel(out, seen, imageModelInfo(model, EditKind))
+		}
+	}
+}
+
+func specFrom(model imageCatalogModel) ImageSpec {
+	constraints := model.ModelSpec.Constraints
+	return ImageSpec{
+		Steps:             constraints.Steps.Default,
+		Divisor:           constraints.WidthHeightDivisor,
+		AspectRatios:      constraints.AspectRatios,
+		DefaultResolution: constraints.DefaultResolution,
+		Qualities:         constraints.Qualities,
+		MaxInputImages:    constraints.MaxInputImages,
+		CombineImages:     constraints.CombineImages,
+		PromptLimit:       constraints.PromptCharacterLimit,
+	}
+}
+
+func online(models []imageCatalogModel) []imageCatalogModel {
+	out := make([]imageCatalogModel, 0, len(models))
+	for _, model := range models {
+		if !model.ModelSpec.Offline {
+			out = append(out, model)
+		}
+	}
+	return out
+}
+
+// baseName compares display names without suffixes such as "(SOTA)".
+func baseName(model imageCatalogModel) string {
+	name, _, _ := strings.Cut(model.ModelSpec.Name, "(")
+	return strings.ToLower(strings.TrimSpace(name))
 }
 
 func fetchImageCatalog(ctx context.Context, client pluginapi.HostHTTPClient, kind string) ([]imageCatalogModel, error) {

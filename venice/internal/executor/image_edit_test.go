@@ -22,7 +22,7 @@ const editTestStorage = `{"type":"venice","cookie":"__client=x","authorization":
 func TestExecuteImageEditSendsWebAppMultiEditForm(t *testing.T) {
 	var form bytes.Buffer
 	writer := multipart.NewWriter(&form)
-	_ = writer.WriteField("model", "gpt-image-2-edit")
+	_ = writer.WriteField("model", "gpt-image-2")
 	_ = writer.WriteField("prompt", "make it blue")
 	_ = writer.WriteField("size", "1536x1024")
 	_ = writer.WriteField("quality", "high")
@@ -32,7 +32,7 @@ func TestExecuteImageEditSendsWebAppMultiEditForm(t *testing.T) {
 
 	client := &fakeEditClient{}
 	resp, err := NewExecutor().Execute(context.Background(), pluginapi.ExecutorRequest{
-		Model:        "gpt-image-2-edit",
+		Model:        "gpt-image-2",
 		SourceFormat: models.ImageModelType,
 		Headers:      http.Header{"Content-Type": []string{writer.FormDataContentType()}},
 		Payload:      form.Bytes(),
@@ -62,11 +62,11 @@ func TestExecuteImageEditAcceptsJSONDataURLs(t *testing.T) {
 	mask := "data:image/png;base64," + base64.StdEncoding.EncodeToString([]byte("png-mask"))
 	client := &fakeEditClient{}
 	resp, err := NewExecutor().Execute(context.Background(), pluginapi.ExecutorRequest{
-		Model:        "gpt-image-2-edit",
+		Model:        "gpt-image-2",
 		SourceFormat: models.ImageModelType,
 		Headers:      http.Header{"Content-Type": []string{"application/json"}},
 		Metadata:     map[string]any{"request_path": "/v1/images/edits"},
-		Payload:      []byte(`{"model":"gpt-image-2-edit","prompt":"add a hat","images":[{"image_url":"` + image + `"}],"mask":{"image_url":{"url":"` + mask + `"}}}`),
+		Payload:      []byte(`{"model":"gpt-image-2","prompt":"add a hat","images":[{"image_url":"` + image + `"}],"mask":{"image_url":{"url":"` + mask + `"}}}`),
 		StorageJSON:  []byte(editTestStorage),
 		HTTPClient:   client,
 	})
@@ -100,9 +100,9 @@ func TestImageRequestsRejectWrongModelsAndLimitsAsClientErrors(t *testing.T) {
 		err  error
 		want string
 	}{
-		"generation model on edits": {edit("flux-2-pro", one), "use its -edit model"},
-		"too many images":           {edit("gpt-image-2-edit", one+","+one+","+one), "at most 2 input images"},
-		"remote image url":          {edit("gpt-image-2-edit", `{"image_url":"https://example.com/a.png"}`), "base64 data: URL"},
+		"generation model on edits": {edit("flux-2-pro", one), "cannot edit images"},
+		"too many images":           {edit("gpt-image-2", one+","+one+","+one), "at most 2 input images"},
+		"remote image url":          {edit("gpt-image-2", `{"image_url":"https://example.com/a.png"}`), "base64 data: URL"},
 	}
 	_, errGenerate := NewExecutor().Execute(context.Background(), pluginapi.ExecutorRequest{
 		Model:        "gpt-image-2-edit",
@@ -150,7 +150,7 @@ func (c *fakeEditClient) Do(_ context.Context, req pluginapi.HTTPRequest) (plugi
 	case strings.Contains(req.URL, "type=inpaint"):
 		return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"data":[{"id":"gpt-image-2-edit","type":"inpaint","model_spec":{"name":"GPT Image 2","constraints":{"aspectRatios":["auto","1:1","3:2","2:3"],"combineImages":true,"maxInputImages":2,"promptCharacterLimit":100,"defaultResolution":"1K","qualities":["low","medium","high"]}}}]}`)}, nil
 	case strings.Contains(req.URL, "type=image"):
-		return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"data":[{"id":"flux-2-pro","type":"image","model_spec":{"name":"Flux 2 Pro","constraints":{"aspectRatios":["1:1"]}}}]}`)}, nil
+		return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"data":[{"id":"flux-2-pro","type":"image","model_spec":{"name":"Flux 2 Pro","constraints":{"aspectRatios":["1:1"]}}},{"id":"gpt-image-2","type":"image","model_spec":{"name":"GPT Image 2","constraints":{"aspectRatios":["1:1"]}}}]}`)}, nil
 	case req.URL == imageEditURL:
 		c.authorization = req.Headers.Get("Authorization")
 		_, params, _ := mime.ParseMediaType(req.Headers.Get("Content-Type"))

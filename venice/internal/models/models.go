@@ -94,17 +94,11 @@ func fetchCatalog(ctx context.Context, client pluginapi.HostHTTPClient) ([]plugi
 		info.MaxCompletionTokens = info.OutputTokenLimit
 		addModel(&out, seen, info)
 	}
-	// Image and edit models serve CLIProxyAPI's /v1/images endpoints; without them the chat models still count.
-	for _, kind := range []string{ImageKind, EditKind} {
-		images, errImages := fetchImageCatalog(ctx, client, kind)
-		if errImages != nil {
-			continue
-		}
-		for _, model := range images {
-			if !model.ModelSpec.Offline {
-				addModel(&out, seen, imageModelInfo(model, kind))
-			}
-		}
+	// Image models serve CLIProxyAPI's /v1/images endpoints; without them the chat models still count.
+	if gens, errGens := fetchImageCatalog(ctx, client, ImageKind); errGens == nil {
+		// Without the edit catalog the image models still generate.
+		edits, _ := fetchImageCatalog(ctx, client, EditKind)
+		addImageModels(&out, seen, gens, edits)
 	}
 	return out, nil
 }

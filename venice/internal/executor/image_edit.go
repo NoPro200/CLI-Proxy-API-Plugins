@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -60,8 +61,13 @@ func (e *Executor) executeImageEdit(ctx context.Context, req pluginapi.ExecutorR
 		return pluginapi.ExecutorResponse{}, errStorage
 	}
 	client := requireClient(req.HTTPClient)
-	spec, errSpec := fetchSpec(ctx, client, models.EditKind, req.Model)
-	if errSpec != nil {
+	editModel, spec, errSpec := models.ResolveEdit(ctx, client, req.Model)
+	switch {
+	case errors.Is(errSpec, models.ErrNoEditModel):
+		return pluginapi.ExecutorResponse{}, badRequest("%s cannot edit images: Venice has no edit model for it", req.Model)
+	case errors.Is(errSpec, models.ErrModelNotFound):
+		return pluginapi.ExecutorResponse{}, badRequest("%v", errSpec)
+	case errSpec != nil:
 		return pluginapi.ExecutorResponse{}, errSpec
 	}
 	if errValidate := validateImageEdit(req.Model, editReq, spec); errValidate != nil {
@@ -85,7 +91,7 @@ func (e *Executor) executeImageEdit(ctx context.Context, req pluginapi.ExecutorR
 	headers.Set("Accept", "application/json, text/event-stream")
 	data := make([]map[string]any, 0, 4)
 	for range min(max(editReq.N, 1), 4) {
-		body, contentType, errBody := buildImageEditBody(req.Model, editReq, spec)
+		body, contentType, errBody := buildImageEditBody(editModel, editReq, spec)
 		if errBody != nil {
 			return pluginapi.ExecutorResponse{}, errBody
 		}
