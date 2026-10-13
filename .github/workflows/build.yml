@@ -5,6 +5,7 @@ on:
     paths:
       - 'gemini-cli/**'
       - 'venice/**'
+      - 'model-merger/**'
       - '.github/workflows/build.yml'
   push:
     tags:
@@ -28,6 +29,7 @@ jobs:
         plugin:
           - { id: nopro200-gemini-cli, dir: gemini-cli, cmd: ./cmd/geminicli }
           - { id: nopro200-venice, dir: venice, cmd: ./cmd/venice }
+          - { id: nopro200-model-merger, dir: model-merger, cmd: ./cmd/model-merger }
     defaults:
       run:
         working-directory: ${{ matrix.plugin.dir }}
@@ -58,6 +60,7 @@ jobs:
         plugin:
           - { id: nopro200-gemini-cli, dir: gemini-cli, cmd: ./cmd/geminicli }
           - { id: nopro200-venice, dir: venice, cmd: ./cmd/venice }
+          - { id: nopro200-model-merger, dir: model-merger, cmd: ./cmd/model-merger }
         target:
           - { goos: linux, goarch: amd64, runner: ubuntu-24.04, ext: so }
           - { goos: linux, goarch: arm64, runner: ubuntu-24.04-arm, ext: so }
@@ -130,6 +133,7 @@ jobs:
         plugin:
           - { id: nopro200-gemini-cli, dir: gemini-cli, cmd: ./cmd/geminicli }
           - { id: nopro200-venice, dir: venice, cmd: ./cmd/venice }
+          - { id: nopro200-model-merger, dir: model-merger, cmd: ./cmd/model-merger }
     env:
       PLUGIN_ID: ${{ matrix.plugin.id }}
     defaults:
@@ -202,6 +206,7 @@ jobs:
         plugin:
           - { id: nopro200-gemini-cli, dir: gemini-cli, cmd: ./cmd/geminicli }
           - { id: nopro200-venice, dir: venice, cmd: ./cmd/venice }
+          - { id: nopro200-model-merger, dir: model-merger, cmd: ./cmd/model-merger }
         goarch:
           - amd64
     env:

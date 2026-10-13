@@ -1,0 +1,144 @@
+package executor
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+)
+
+// HopHeader marks requests the plugin sends to the host, so a request that
+// comes back to a virtual model through a misconfiguration stops at once.
+const HopHeader = "X-Model-Merger-Hop"
+
+// maxResponseBytes caps a loopback response; several base64 images fit easily.
+const maxResponseBytes = 512 << 20
+
+// ErrLoopbackUnconfigured reports a plugin config without an access key.
+var ErrLoopbackUnconfigured = errors.New("model-merger: set access-key under plugins.configs.nopro200-model-merger in config.yaml")
+
+// Loopback calls CLIProxyAPI's own HTTP API. The host's plugin callback
+// host.model.execute refuses gpt-image-* models outside the images routes, so
+// targets are reached through the public /v1/images/generations route instead.
+type Loopback struct {
+	BaseURL   string
+	AccessKey string
+	Client    *http.Client
+}
+
+// NewLoopback builds a client that never uses a proxy: the host is local.
+func NewLoopback(baseURL, accessKey string) *Loopback {
+	return &Loopback{
+		BaseURL:   strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+		AccessKey: strings.TrimSpace(accessKey),
+		Client:    &http.Client{Transport: &http.Transport{Proxy: nil, ForceAttemptHTTP2: false}},
+	}
+}
+
+// Configured reports whether model calls can authenticate.
+func (l *Loopback) Configured() bool {
+	return l != nil && l.BaseURL != "" && l.AccessKey != ""
+}
+
+// Response is a loopback reply; a transport failure leaves Status at 0.
+type Response struct {
+	Status  int
+	Headers http.Header
+	Body    []byte
+}
+
+// Do sends one request. authorization overrides the access key, so management
+// calls can forward the caller's management key without storing it.
+func (l *Loopback) Do(ctx context.Context, method, path string, body []byte, authorization string, extra http.Header) (Response, error) {
+	if l == nil || l.BaseURL == "" {
+		return Response{}, ErrLoopbackUnconfigured
+	}
+	if authorization == "" {
+		if l.AccessKey == "" {
+			return Response{}, ErrLoopbackUnconfigured
+		}
+		authorization = "Bearer " + l.AccessKey
+	}
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, errReq := http.NewRequestWithContext(ctx, method, l.BaseURL+path, reader)
+	if errReq != nil {
+		return Response{}, errReq
+	}
+	for key, values := range extra {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+	req.Header.Set("Authorization", authorization)
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	client := l.Client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, errDo := client.Do(req)
+	if errDo != nil {
+		return Response{}, errDo
+	}
+	defer resp.Body.Close()
+	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if errRead != nil {
+		return Response{}, errRead
+	}
+	return Response{Status: resp.StatusCode, Headers: resp.Header, Body: raw}, nil
+}
+
+// ModelIDs lists the models the access key can use, for target suggestions
+// and to keep an alias from shadowing a real model.
+func (l *Loopback) ModelIDs(ctx context.Context) (map[string]string, error) {
+	resp, errDo := l.Do(ctx, http.MethodGet, "/v1/models", nil, "", nil)
+	if errDo != nil {
+		return nil, errDo
+	}
+	if resp.Status != http.StatusOK {
+		return nil, fmt.Errorf("list models: status %d", resp.Status)
+	}
+	var payload struct {
+		Data []struct {
+			ID      string `json:"id"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	if errDecode := json.Unmarshal(resp.Body, &payload); errDecode != nil {
+		return nil, fmt.Errorf("decode models: %w", errDecode)
+	}
+	out := make(map[string]string, len(payload.Data))
+	for _, model := range payload.Data {
+		if id := strings.TrimSpace(model.ID); id != "" {
+			out[id] = model.OwnedBy
+		}
+	}
+	return out, nil
+}
+
+// DeleteAuthFile removes an auth file through the host's management API. The
+// plugin host offers no delete callback, so the caller's management key is
+// forwarded for this one request.
+func (l *Loopback) DeleteAuthFile(ctx context.Context, managementAuthorization, name string) error {
+	if strings.TrimSpace(managementAuthorization) == "" {
+		return errors.New("management key is missing")
+	}
+	resp, errDo := l.Do(ctx, http.MethodDelete, "/v0/management/auth-files?name="+url.QueryEscape(name), nil, managementAuthorization, nil)
+	if errDo != nil {
+		return errDo
+	}
+	if resp.Status != http.StatusOK {
+		return fmt.Errorf("delete %s: status %d: %s", name, resp.Status, strings.TrimSpace(string(resp.Body)))
+	}
+	return nil
+}
