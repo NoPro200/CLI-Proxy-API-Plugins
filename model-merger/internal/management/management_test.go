@@ -51,13 +51,25 @@ func (h *fakeHost) SaveAuth(_ context.Context, name string, raw json.RawMessage)
 }
 
 type fakeLoopback struct {
+	accessKey   bool
+	clientKey   string
 	models      map[string]string
 	modelsErr   error
+	modelAuths  []string
+	keyAuths    []string
 	deleted     []string
 	deleteAuths []string
 }
 
-func (l *fakeLoopback) ModelIDs(context.Context) (map[string]string, error) {
+func (l *fakeLoopback) HasAccessKey() bool { return l.accessKey }
+
+func (l *fakeLoopback) ClientKey(_ context.Context, managementAuthorization string) (string, error) {
+	l.keyAuths = append(l.keyAuths, managementAuthorization)
+	return l.clientKey, nil
+}
+
+func (l *fakeLoopback) ModelIDs(_ context.Context, authorization string) (map[string]string, error) {
+	l.modelAuths = append(l.modelAuths, authorization)
 	return l.models, l.modelsErr
 }
 
@@ -70,7 +82,7 @@ func (l *fakeLoopback) DeleteAuthFile(_ context.Context, authorization, name str
 func newFixture() (*Provider, *fakeHost, *fakeLoopback) {
 	host := newFakeHost()
 	host.put("venice-a.json", "venice", `{"type":"venice","cookie":"__client=secret-cookie"}`)
-	loopback := &fakeLoopback{models: map[string]string{"gpt-image-2.5-sunburst": "openai", "qwen-image-3-pro": "venice"}}
+	loopback := &fakeLoopback{clientKey: "sk-client-secret", models: map[string]string{"gpt-image-2.5-sunburst": "openai", "qwen-image-3-pro": "venice"}}
 	return New(loopback), host, loopback
 }
 
@@ -91,7 +103,7 @@ func call(t *testing.T, p *Provider, host HostClient, method, path, body string,
 		if errDecode := json.Unmarshal(resp.Body, &out); errDecode != nil {
 			t.Fatalf("decode %s: %v", resp.Body, errDecode)
 		}
-		if strings.Contains(string(resp.Body), "mgmt-secret") || strings.Contains(string(resp.Body), "secret-cookie") {
+		if strings.Contains(string(resp.Body), "mgmt-secret") || strings.Contains(string(resp.Body), "secret-cookie") || strings.Contains(string(resp.Body), "sk-client-secret") {
 			t.Fatalf("response leaks a secret: %s", resp.Body)
 		}
 	}
@@ -222,5 +234,32 @@ func TestRegisterManagementRoutes(t *testing.T) {
 	}
 	if len(resp.Resources) != 1 || resp.Resources[0].Path != resourcePath {
 		t.Fatalf("resources = %+v", resp.Resources)
+	}
+}
+
+func TestModelListWithoutAccessKeyBorrowsAHostKey(t *testing.T) {
+	p, host, loopback := newFixture()
+	if status, _ := call(t, p, host, http.MethodGet, jsonPath, "", nil); status != http.StatusOK {
+		t.Fatalf("status = %d", status)
+	}
+	if len(loopback.keyAuths) != 1 || loopback.keyAuths[0] != "Bearer mgmt-secret" {
+		t.Fatalf("api-keys read with %v", loopback.keyAuths)
+	}
+	if len(loopback.modelAuths) != 1 || loopback.modelAuths[0] != "Bearer sk-client-secret" {
+		t.Fatalf("models read with %v", loopback.modelAuths)
+	}
+
+	// A host without api-keys accepts the model list without credentials.
+	loopback.clientKey, loopback.modelAuths = "", nil
+	call(t, p, host, http.MethodGet, jsonPath, "", nil)
+	if len(loopback.modelAuths) != 1 || loopback.modelAuths[0] != "" {
+		t.Fatalf("models read with %v", loopback.modelAuths)
+	}
+
+	// A configured access key is used as is.
+	loopback.accessKey, loopback.keyAuths, loopback.modelAuths = true, nil, nil
+	call(t, p, host, http.MethodGet, jsonPath, "", nil)
+	if len(loopback.keyAuths) != 0 || len(loopback.modelAuths) != 1 {
+		t.Fatalf("access key path: keys=%v models=%v", loopback.keyAuths, loopback.modelAuths)
 	}
 }

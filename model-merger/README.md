@@ -22,13 +22,9 @@ Requires CLIProxyAPI v7.3.4 or newer: the plugin is built with SDK v7.3.20 and d
 
 ## Installation
 
-Add this repository's registry to the host `config.yaml`, install `nopro200-model-merger` from the plugin store and give the plugin an access key:
+Add this repository's registry to the host `config.yaml` and install `nopro200-model-merger` from the plugin store. Nothing else is needed when CLIProxyAPI listens on port 8317:
 
 ```yaml
-api-keys:
-  - "sk-your-client-key"
-  - "sk-model-merger"          # used only by the plugin
-
 plugins:
   enabled: true
   store-sources:
@@ -36,18 +32,24 @@ plugins:
   configs:
     nopro200-model-merger:
       enabled: true
-      access-key: "sk-model-merger"   # required, one of api-keys
-      port: 8317                      # optional, default 8317
-      # loopback-url: "https://127.0.0.1:8317"  # optional, overrides port (e.g. with TLS)
+      # port: 8317                              # only if CLIProxyAPI listens elsewhere
+      # loopback-url: "https://127.0.0.1:8317"  # instead of port, e.g. with TLS
+      # access-key: "sk-..."                    # optional, see below
 ```
 
-### Why a loopback call
+### How targets are called
 
-The plugin reaches the targets through the host's own `POST http://127.0.0.1:<port>/v1/images/generations`, authenticated with `access-key`. It does not use a proxy for this call.
+The plugin reaches the targets through the host's own `POST http://127.0.0.1:<port>/v1/images/generations`, without a proxy.
 
 SDK v7.3.20 offers an internal model call (`host.model.execute`), but it runs requests with image models disallowed: models such as `gpt-image-2.5-sunburst` are refused with `503 model ... is only supported on /v1/images/generations and /v1/images/edits`. The public images route is the only path that serves every image model, so the plugin uses it.
 
-The access key is visible to anyone who can read the plugin config through the management API. Use a dedicated key.
+Credentials:
+
+- **Image requests** forward the client's own API key (`Authorization`, `X-Api-Key`, `X-Goog-Api-Key`, or `?key=` / `?auth_token=` as a bearer token). Every target runs under the key the client used. A host without `api-keys` needs no key at all.
+- **The management page** lists models for target suggestions and the alias check with one of the host's `api-keys`, which it reads through `GET /v0/management/api-keys` with the management key you entered. That key stays in the plugin and is never sent to the browser.
+- **`access-key`** (optional) replaces both: every target call then runs under this one key. It is visible to anyone who can read the plugin config through the management API, so use a dedicated key.
+
+The host does not tell plugins its port. If CLIProxyAPI does not listen on 8317, set `port` or `loopback-url`.
 
 ## Auth Storage
 
