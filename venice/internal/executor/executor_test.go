@@ -311,6 +311,10 @@ func TestNeedsToolRepair(t *testing.T) {
 		{"bold lead-in", tools, "**Ich prüfe zuerst:**", true},
 		{"final answer", tools, "Fertig, die Datei ist angelegt.", false},
 		{"tool call", tools, `{"tool_calls":[{"name":"list_files","arguments":{}}]}`, false},
+		// GLM emits a tool call as JSON but drops a brace, so parsing fails; repair it instead of showing it.
+		{"broken tool-call json", tools, `{"tool_calls":[{"name":"run_command","arguments":{"command":"ls"}]}]}`, true},
+		{"native tool_call tag", tools, "<tool_call>{\"name\":\"list_files\"", true},
+		{"prose mentioning a tool", tools, "Ich rufe gleich list_files mit arguments auf.", false},
 		{"no tools", openAIRequest{}, "", false},
 		{"tool_choice none", none, "", false},
 	}

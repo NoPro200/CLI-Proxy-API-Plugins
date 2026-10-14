@@ -354,7 +354,7 @@ func formatAssistantToolCalls(calls []openAIToolCall) string {
 const toolReminder = `(Tool reminder: to call a tool, reply with only {"tool_calls":[{"name":"tool_name","arguments":{}}]}. Never use <tool_call> tags.)`
 
 // toolRepairPrompt asks once more for a call that Venice cut off.
-const toolRepairPrompt = "Your tool call did not arrive. Reply now with only the JSON object for the tool call you intended."
+const toolRepairPrompt = `Your tool call did not arrive. Reply with only this JSON and nothing else, with valid braces: {"tool_calls":[{"name":"<tool>","arguments":{<args>}}]}`
 
 func toolInstructions(req openAIRequest) string {
 	if len(req.Tools) == 0 {
@@ -391,7 +391,22 @@ func needsToolRepair(req openAIRequest, content string) bool {
 		return false
 	}
 	text := strings.TrimRight(strings.TrimSpace(content), "*_ ")
-	return text == "" || strings.HasSuffix(text, ":")
+	return text == "" || strings.HasSuffix(text, ":") || looksLikeToolCallAttempt(text)
+}
+
+// looksLikeToolCallAttempt spots a tool call the model emitted as text that
+// parseToolCalls could not read, typically GLM's JSON with a stray brace or its
+// native <tool_call> tag. Repairing it turns the visible JSON into a real call.
+func looksLikeToolCallAttempt(text string) bool {
+	if strings.Contains(text, "<tool_call") {
+		return true
+	}
+	// Only a body that is primarily the tool-call JSON, not prose that mentions a tool.
+	if !strings.HasPrefix(text, "{") && !strings.HasPrefix(text, "[") {
+		return false
+	}
+	return strings.Contains(text, `"tool_calls"`) || strings.Contains(text, `"toolCalls"`) ||
+		(strings.Contains(text, `"name"`) && strings.Contains(text, `"arguments"`))
 }
 
 // repairToolCall asks Venice once more for a tool call it cut off and returns the
