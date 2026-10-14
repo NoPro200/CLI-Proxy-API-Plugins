@@ -139,7 +139,7 @@ func buildImageRequest(model string, req openAIImageRequest, spec models.ImageSp
 		"format":               "png",
 		"height":               height,
 		"hideWatermark":        plan != "" && !strings.EqualFold(plan, "free"),
-		"matureFilter":         !strings.EqualFold(req.Moderation, "low"),
+		"matureFilter": req.Moderation != "" && !strings.EqualFold(req.Moderation, "low"),
 		"modelId":              model,
 		"prompt":               req.Prompt,
 		"steps":                steps,
