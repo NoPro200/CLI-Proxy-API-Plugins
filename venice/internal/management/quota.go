@@ -41,8 +41,8 @@ func quotaResponse(storage authpkg.Storage) pluginapi.QuotaFetchResponse {
 	}
 	creditCap := quotaMetric(storage.Quota, []string{"bundledCreditsUsage", "tierCap"}, []string{"bundledCreditsUsage", "monthlyRefillCredits"})
 	credits := creditAvailable(storage.Quota, creditCap)
-	if credits > 0 || creditCap > 0 {
-		resp.Summary = []pluginapi.QuotaMetric{{Key: "credits", Label: "Credits", Value: credits, Format: "number"}}
+	if total := totalCredits(storage.Quota, credits); total > 0 || creditCap > 0 {
+		resp.Summary = []pluginapi.QuotaMetric{{Key: "credits", Label: "Credits", Value: total, Format: "number"}}
 	}
 	var buckets []pluginapi.QuotaBucket
 	if creditCap > 0 {

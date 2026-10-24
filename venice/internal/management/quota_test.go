@@ -7,7 +7,7 @@ import (
 )
 
 func TestQuotaResponseMapsVeniceUsage(t *testing.T) {
-	storage, err := authpkg.ParseStorage([]byte(`{"type":"venice","cookie":"__client=secret","account_plan":"PRO","quota":{"bundledCreditsUsage":{"availableCredits":25,"tierCap":100,"nextRefillAt":1784460283868},"rateLimits":{"conversation":{"remaining":1800,"resetAt":1784460283868}}}}`))
+	storage, err := authpkg.ParseStorage([]byte(`{"type":"venice","cookie":"__client=secret","account_plan":"PRO","quota":{"bundledCreditsUsage":{"availableCredits":25,"tierCap":100,"nextRefillAt":1784460283868},"rateLimits":{"conversation":{"remaining":1800,"resetAt":1784460283868}},"veniceCredits":1089}}`))
 	if err != nil || storage == nil {
 		t.Fatalf("ParseStorage = %#v, %v", storage, err)
 	}
@@ -15,7 +15,7 @@ func TestQuotaResponseMapsVeniceUsage(t *testing.T) {
 	if resp.Subscription == nil || resp.Subscription.Plan != "PRO" {
 		t.Fatalf("subscription = %#v", resp.Subscription)
 	}
-	if len(resp.Summary) != 1 || resp.Summary[0].Key != "credits" || resp.Summary[0].Value != 25 {
+	if len(resp.Summary) != 1 || resp.Summary[0].Key != "credits" || resp.Summary[0].Value != 25+1089 {
 		t.Fatalf("summary = %#v", resp.Summary)
 	}
 	if len(resp.Groups) != 1 || len(resp.Groups[0].Buckets) != 2 {
@@ -27,5 +27,10 @@ func TestQuotaResponseMapsVeniceUsage(t *testing.T) {
 	}
 	if conversation.Window != "conversation" || conversation.RemainingFraction != 0.5 {
 		t.Fatalf("conversation bucket = %#v", conversation)
+	}
+	// The balance must not stand in for the monthly bundle when Venice omits availableCredits.
+	storage.Quota["bundledCreditsUsage"] = map[string]any{"tierCap": float64(100), "usedThisCycle": float64(40)}
+	if got := quotaResponse(*storage); got.Summary[0].Value != 60+1089 || got.Groups[0].Buckets[0].RemainingFraction != 0.6 {
+		t.Fatalf("without availableCredits: summary = %#v, groups = %#v", got.Summary, got.Groups)
 	}
 }

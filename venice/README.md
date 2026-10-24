@@ -14,7 +14,7 @@ It is a fork of [trungking/cpa-plugin-venice](https://github.com/trungking/cpa-p
 - Passes Venice streaming chunks through the host stream path.
 - Lists each account's live Venice model catalog with display names. Offline models and E2EE models, which need client-side encryption, are left out.
 - Generates images with Venice image models through CLIProxyAPI's `/v1/images/generations`.
-- Reports plan, credits and rate limits through the CLIProxyAPI quota API, which the management center shows on its quota and auth file pages (releases after v1.25.6).
+- Reports plan, credits (the rest of the monthly bundle plus the credit balance) and rate limits through the CLIProxyAPI quota API, which the management center shows on its quota and auth file pages (releases after v1.25.6).
 - Exposes Venice account status, quota metadata and a realtime request monitor through CLIProxyAPI plugin management routes.
 
 Requires CLIProxyAPI v7.3.4 or newer: the plugin is built with SDK v7.3.20 and declares RPC schema version 6.
