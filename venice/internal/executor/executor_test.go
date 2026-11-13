@@ -314,6 +314,9 @@ func TestNeedsToolRepair(t *testing.T) {
 		// GLM emits a tool call as JSON but drops a brace, so parsing fails; repair it instead of showing it.
 		{"broken tool-call json", tools, `{"tool_calls":[{"name":"run_command","arguments":{"command":"ls"}]}]}`, true},
 		{"native tool_call tag", tools, "<tool_call>{\"name\":\"list_files\"", true},
+		{"deepseek dsml call", tools, deepseekDSMLCall, false},
+		// A cut-off DSML call cannot be parsed, so it gets the repair round.
+		{"cut deepseek dsml call", tools, "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"search_tools\">", true},
 		{"prose mentioning a tool", tools, "Ich rufe gleich list_files mit arguments auf.", false},
 		{"no tools", openAIRequest{}, "", false},
 		{"tool_choice none", none, "", false},
@@ -322,6 +325,35 @@ func TestNeedsToolRepair(t *testing.T) {
 		if got := needsToolRepair(tc.req, tc.content); got != tc.want {
 			t.Errorf("%s: needsToolRepair = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// deepseekDSMLCall is DeepSeek V4.1 Flash's raw answer from an OpenWebUI terminal chat.
+const deepseekDSMLCall = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"search_tools\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">run shell command terminal exec</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+
+func TestParseToolCallsReadsDeepSeekDSML(t *testing.T) {
+	calls, ok := parseToolCalls(deepseekDSMLCall)
+	if !ok || len(calls) != 1 || calls[0].Function.Name != "search_tools" || calls[0].Function.Arguments != `{"query":"run shell command terminal exec"}` {
+		t.Fatalf("calls = %#v, ok = %v", calls, ok)
+	}
+	// Official spelling with ASCII bars, two invokes, and JSON values marked string="false".
+	text := `<|DSML|function_calls>
+<|DSML|invoke name="call_tool">
+<|DSML|parameter name="calls" string="false">[{"tool_name":"run_command","params":"{\"command\":\"ls\"}"}]</|DSML|parameter>
+<|DSML|parameter name="count" string="false">2</|DSML|parameter>
+</|DSML|invoke>
+<|DSML|invoke name="list_files"></|DSML|invoke>
+</|DSML|function_calls>`
+	calls, ok = parseToolCalls(text)
+	if !ok || len(calls) != 2 || calls[0].Function.Name != "call_tool" || calls[1].Function.Name != "list_files" || calls[1].Function.Arguments != "{}" {
+		t.Fatalf("calls = %#v, ok = %v", calls, ok)
+	}
+	var args struct {
+		Calls []map[string]string `json:"calls"`
+		Count int                 `json:"count"`
+	}
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil || args.Count != 2 || len(args.Calls) != 1 || args.Calls[0]["tool_name"] != "run_command" {
+		t.Fatalf("call_tool arguments = %s (%v)", calls[0].Function.Arguments, err)
 	}
 }
 

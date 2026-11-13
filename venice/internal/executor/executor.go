@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -398,7 +399,7 @@ func needsToolRepair(req openAIRequest, content string) bool {
 // parseToolCalls could not read, typically GLM's JSON with a stray brace or its
 // native <tool_call> tag. Repairing it turns the visible JSON into a real call.
 func looksLikeToolCallAttempt(text string) bool {
-	if strings.Contains(text, "<tool_call") {
+	if strings.Contains(text, "<tool_call") || dsmlTag.MatchString(text) {
 		return true
 	}
 	// Only a body that is primarily the tool-call JSON, not prose that mentions a tool.
@@ -824,7 +825,46 @@ func parseToolCalls(text string) ([]openAIToolCall, bool) {
 			return calls, true
 		}
 	}
-	return nil, false
+	return parseDSMLToolCalls(text)
+}
+
+// DeepSeek ignores the JSON instruction and writes tool calls in its own DSML
+// markup, with fullwidth or ASCII bars and sometimes spaces after them:
+// <｜DSML｜invoke name="f"><｜DSML｜parameter name="k" string="true">v</｜DSML｜parameter></｜DSML｜invoke>
+const (
+	dsmlOpen  = `<\s*[｜|]\s*DSML\s*[｜|]\s*`
+	dsmlClose = `<\s*/\s*[｜|]\s*DSML\s*[｜|]\s*`
+)
+
+var (
+	dsmlTag       = regexp.MustCompile(`<\s*/?\s*[｜|]\s*DSML\s*[｜|]`)
+	dsmlInvoke    = regexp.MustCompile(`(?s)` + dsmlOpen + `invoke\s+name="([^"]+)"\s*>(.*?)` + dsmlClose + `invoke\s*>`)
+	dsmlParameter = regexp.MustCompile(`(?s)` + dsmlOpen + `parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>(.*?)` + dsmlClose + `parameter\s*>`)
+)
+
+func parseDSMLToolCalls(text string) ([]openAIToolCall, bool) {
+	invokes := dsmlInvoke.FindAllStringSubmatch(text, -1)
+	if len(invokes) == 0 {
+		return nil, false
+	}
+	calls := make([]openAIToolCall, 0, len(invokes))
+	for i, invoke := range invokes {
+		args := make(map[string]any)
+		for _, param := range dsmlParameter.FindAllStringSubmatch(invoke[2], -1) {
+			args[param[1]] = param[3]
+			// string="false" marks a JSON value: number, bool, list or object.
+			var value any
+			if param[2] == "false" && json.Unmarshal([]byte(strings.TrimSpace(param[3])), &value) == nil {
+				args[param[1]] = value
+			}
+		}
+		call, ok := normalizeToolCall(map[string]any{"name": invoke[1], "arguments": args}, i)
+		if !ok {
+			return nil, false
+		}
+		calls = append(calls, call)
+	}
+	return calls, true
 }
 
 func toolJSONCandidates(text string) []string {
