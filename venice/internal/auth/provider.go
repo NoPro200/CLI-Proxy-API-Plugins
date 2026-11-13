@@ -26,6 +26,7 @@ const (
 	StorageType          = "venice"
 	clerkClientURL       = "https://clerk.venice.ai/v1/client?__clerk_api_version=2026-05-12&_clerk_js_version=6.22.0"
 	veniceUserSessionURL = "https://outerface.venice.ai/api/user/session?bustBalanceCache=true"
+	veniceWebModelsURL   = "https://outerface.venice.ai/api/app/models?matureFilter=false&onlySafeVenice=false"
 	refreshLead          = 30 * time.Second
 	defaultRefreshAfter  = 10 * time.Minute
 	loginStateTTL        = 15 * time.Minute
@@ -408,21 +409,39 @@ func clerkToken(ctx context.Context, client pluginapi.HostHTTPClient, storage *S
 	return payload.JWT, nil
 }
 
+// FetchWebModels returns the Venice web app's model list for the account. The
+// web chat accepts only these models, some under other ids than the API catalog.
+func FetchWebModels(ctx context.Context, client pluginapi.HostHTTPClient, storage *Storage) ([]byte, error) {
+	if ShouldRefreshStorage(*storage, time.Now()) {
+		if errRefresh := RefreshStorage(ctx, client, storage); errRefresh != nil {
+			return nil, errRefresh
+		}
+	}
+	resp, errDo := client.Do(ctx, pluginapi.HTTPRequest{Method: http.MethodGet, URL: veniceWebModelsURL, Headers: webHeaders(*storage)})
+	if errDo != nil {
+		return nil, errDo
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, statusErrorf(resp.StatusCode, "venice web models failed: status %d", resp.StatusCode)
+	}
+	return resp.Body, nil
+}
+
+func webHeaders(storage Storage) http.Header {
+	return http.Header{
+		"Accept":                        []string{"application/json"},
+		"Authorization":                 []string{storage.Authorization},
+		"Origin":                        []string{"https://venice.ai"},
+		"Referer":                       []string{"https://venice.ai/"},
+		"User-Agent":                    []string{userAgent()},
+		"X-Venice-Version":              []string{"interface@20260627.111727+571b7be"},
+		"x-venice-locale":               []string{"en"},
+		"x-venice-request-timestamp-ms": []string{fmt.Sprintf("%d", time.Now().UnixMilli())},
+	}
+}
+
 func fetchVeniceUserSession(ctx context.Context, client pluginapi.HostHTTPClient, storage *Storage) error {
-	resp, errDo := client.Do(ctx, pluginapi.HTTPRequest{
-		Method: http.MethodGet,
-		URL:    veniceUserSessionURL,
-		Headers: http.Header{
-			"Accept":                        []string{"application/json"},
-			"Authorization":                 []string{storage.Authorization},
-			"Origin":                        []string{"https://venice.ai"},
-			"Referer":                       []string{"https://venice.ai/"},
-			"User-Agent":                    []string{userAgent()},
-			"X-Venice-Version":              []string{"interface@20260627.111727+571b7be"},
-			"x-venice-locale":               []string{"en"},
-			"x-venice-request-timestamp-ms": []string{fmt.Sprintf("%d", time.Now().UnixMilli())},
-		},
-	})
+	resp, errDo := client.Do(ctx, pluginapi.HTTPRequest{Method: http.MethodGet, URL: veniceUserSessionURL, Headers: webHeaders(*storage)})
 	if errDo != nil {
 		return errDo
 	}

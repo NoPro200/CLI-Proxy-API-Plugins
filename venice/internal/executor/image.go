@@ -50,7 +50,8 @@ func (e *Executor) executeImage(ctx context.Context, req pluginapi.ExecutorReque
 	if errSpec != nil {
 		return pluginapi.ExecutorResponse{}, errSpec
 	}
-	body := buildImageRequest(req.Model, imageReq, spec, storage.AccountPlan)
+	webModel, _ := models.WebID(models.ImageKind, req.Model)
+	body := buildImageRequest(webModel, imageReq, spec, storage.AccountPlan)
 	headers := veniceHeaders(*storage, false)
 	headers.Set("Accept", "application/json, text/event-stream")
 	data := make([]map[string]any, 0, 4)
@@ -139,7 +140,7 @@ func buildImageRequest(model string, req openAIImageRequest, spec models.ImageSp
 		"format":               "png",
 		"height":               height,
 		"hideWatermark":        plan != "" && !strings.EqualFold(plan, "free"),
-		"matureFilter": req.Moderation != "" && !strings.EqualFold(req.Moderation, "low"),
+		"matureFilter":         req.Moderation != "" && !strings.EqualFold(req.Moderation, "low"),
 		"modelId":              model,
 		"prompt":               req.Prompt,
 		"steps":                steps,

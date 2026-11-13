@@ -14,8 +14,10 @@ import (
 // ImageModelType is the model type CLIProxyAPI routes /v1/images requests by.
 const ImageModelType = "openai-image"
 
-// Venice lists image generation and image editing models as separate catalog types.
+// Venice lists text, image generation and image editing models as separate
+// catalog types, in its API catalog and in the web app's model list.
 const (
+	TextKind  = "text"
 	ImageKind = "image"
 	EditKind  = "inpaint"
 )
@@ -219,10 +221,11 @@ func fetchImageCatalog(ctx context.Context, client pluginapi.HostHTTPClient, kin
 	if err := json.Unmarshal(resp.Body, &payload); err != nil {
 		return nil, fmt.Errorf("decode venice %s catalog: %w", kind, err)
 	}
-	// Keep only entries of the requested kind in case the filter is ignored upstream.
+	// Keep only entries of the requested kind in case the filter is ignored
+	// upstream, and only models the web app offers.
 	out := payload.Data[:0]
 	for _, model := range payload.Data {
-		if model.Type == "" || model.Type == kind {
+		if _, offered := WebID(kind, model.ID); offered && (model.Type == "" || model.Type == kind) {
 			out = append(out, model)
 		}
 	}

@@ -12,7 +12,7 @@ It is a fork of [trungking/cpa-plugin-venice](https://github.com/trungking/cpa-p
 - Executes OpenAI `chat.completions` requests against `https://outerface.venice.ai/api/inference/chat`. The host translates other client protocols.
 - Converts Venice newline-delimited response chunks into OpenAI-compatible non-streaming responses.
 - Passes Venice streaming chunks through the host stream path.
-- Lists each account's live Venice model catalog with display names. Offline models and E2EE models, which need client-side encryption, are left out.
+- Lists each account's live Venice model catalog with display names. Offline models and E2EE models, which need client-side encryption, are left out, and so are models the account's Venice web app does not offer (the web chat answers `modelNotFound` for them). Models the web app names differently, such as `kimi-k2-6` (`moonshot.kimi-k2-6`), keep their API id in the list and are sent under the web id.
 - Generates images with Venice image models through CLIProxyAPI's `/v1/images/generations`.
 - Reports plan, credits (the rest of the monthly bundle plus the credit balance) and rate limits through the CLIProxyAPI quota API, which the management center shows on its quota and auth file pages (releases after v1.25.6).
 - Exposes Venice account status, quota metadata and a realtime request monitor through CLIProxyAPI plugin management routes.

@@ -48,6 +48,7 @@ func (p *Provider) ModelsForAuth(ctx context.Context, req pluginapi.AuthModelReq
 	if req.HTTPClient == nil {
 		return pluginapi.ModelResponse{Provider: "venice", Models: fallbackModels()}, nil
 	}
+	refreshWebIDs(ctx, req.HTTPClient, req.StorageJSON)
 	models, err := fetchCatalog(ctx, req.HTTPClient)
 	if err != nil || len(models) == 0 {
 		return pluginapi.ModelResponse{Provider: "venice", Models: fallbackModels()}, nil
@@ -83,6 +84,10 @@ func fetchCatalog(ctx context.Context, client pluginapi.HostHTTPClient) ([]plugi
 	for _, model := range payload.Data {
 		// E2EE models need client-side encryption, which the web chat executor does not do.
 		if model.ModelSpec.Offline || model.ModelSpec.Capabilities["supportsE2EE"] == true {
+			continue
+		}
+		// The web chat answers modelNotFound for models the web app does not offer.
+		if _, offered := WebID(TextKind, model.ID); !offered {
 			continue
 		}
 		info := modelInfo(model.ID, firstNonEmpty(model.DisplayName, model.Name, model.ModelSpec.Name, model.ID), firstPositive(model.ContextLength, model.InputTokenLimit, defaultContext(model.ID)))
@@ -128,7 +133,9 @@ func fallbackModels() []pluginapi.ModelInfo {
 	out := make([]pluginapi.ModelInfo, 0, len(ids))
 	seen := make(map[string]bool)
 	for _, id := range ids {
-		addModel(&out, seen, modelInfo(id, displayName(id), defaultContext(id)))
+		if _, offered := WebID(TextKind, id); offered {
+			addModel(&out, seen, modelInfo(id, displayName(id), defaultContext(id)))
+		}
 	}
 	return out
 }

@@ -89,9 +89,10 @@ func (e *Executor) executeImageEdit(ctx context.Context, req pluginapi.ExecutorR
 	}
 	headers := veniceHeaders(*storage, false)
 	headers.Set("Accept", "application/json, text/event-stream")
+	webModel, _ := models.WebID(models.EditKind, editModel)
 	data := make([]map[string]any, 0, 4)
 	for range min(max(editReq.N, 1), 4) {
-		body, contentType, errBody := buildImageEditBody(editModel, editReq, spec)
+		body, contentType, errBody := buildImageEditBody(webModel, editReq, spec)
 		if errBody != nil {
 			return pluginapi.ExecutorResponse{}, errBody
 		}

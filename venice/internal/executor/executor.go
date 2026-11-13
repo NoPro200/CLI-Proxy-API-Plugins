@@ -1083,8 +1083,11 @@ func veniceHeaders(storage authpkg.Storage, stream bool) http.Header {
 
 func toVeniceWebModelID(model string) string {
 	model = strings.TrimSpace(model)
-	model = strings.Replace(model, "zai-org-glm-5-2", "zai-org-glm-5.2", 1)
-	return model
+	if id, _ := models.WebID(models.TextKind, model); id != model {
+		return id
+	}
+	// Until the web model list arrived, keep the one rename known before it.
+	return strings.Replace(model, "zai-org-glm-5-2", "zai-org-glm-5.2", 1)
 }
 
 func randomID() string {
