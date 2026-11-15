@@ -157,10 +157,12 @@ func modelInfo(id string, display string, context int64) pluginapi.ModelInfo {
 		SupportedInputModalities:   []string{"text"},
 		SupportedOutputModalities:  []string{"text"},
 		SupportedParameters:        []string{"temperature", "top_p", "stream", "response_format"},
+		// CPA rejects levels a model does not list, and Venice's web chat only switches
+		// reasoning on or off: every level must pass, and none must reach the executor.
 		Thinking: &pluginapi.ThinkingSupport{
 			ZeroAllowed:    true,
 			DynamicAllowed: true,
-			Levels:         []string{"none", "auto"},
+			Levels:         []string{"minimal", "low", "medium", "high", "xhigh", "max"},
 		},
 	}
 }

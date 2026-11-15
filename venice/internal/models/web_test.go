@@ -2,6 +2,7 @@ package models
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
@@ -36,6 +37,16 @@ func TestModelsForAuthListsOnlyModelsTheWebAppOffers(t *testing.T) {
 		}
 	}
 
+	if mode, ok := Reasoning("zai-org-glm-5.2"); !ok || mode != (ReasoningMode{Supported: true, Toggle: true}) {
+		t.Fatalf("Reasoning(zai-org-glm-5.2) = %#v, %v", mode, ok)
+	}
+	// Claude Code sends efforts such as xhigh; CPA rejects any level a model does not list.
+	for _, model := range resp.Models {
+		if model.ID == "zai-org-glm-5-2" && (model.Thinking == nil || !model.Thinking.ZeroAllowed || !slices.Contains(model.Thinking.Levels, "xhigh")) {
+			t.Fatalf("thinking support = %#v", model.Thinking)
+		}
+	}
+
 	// A failed web fetch keeps the last list instead of showing every API model again.
 	resp, err = NewProvider().ModelsForAuth(context.Background(), pluginapi.AuthModelRequest{StorageJSON: storage, HTTPClient: webCatalogClient{webStatus: 500}})
 	if err != nil || hasModel(resp.Models, "deepseek-v4-1-flash-1017") || !hasModel(resp.Models, "zai-org-glm-5-2") {
@@ -53,7 +64,7 @@ func (c webCatalogClient) Do(_ context.Context, req pluginapi.HTTPRequest) (plug
 		}
 		return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{
 			"text":{"models":[
-				{"id":"zai-org-glm-5.2","apiModelId":"zai-org-glm-5-2","active":true},
+				{"id":"zai-org-glm-5.2","apiModelId":"zai-org-glm-5-2","active":true,"supportsReasoning":true,"supportsReasonToggle":true},
 				{"id":"zai-org-glm-5.1","aliasIds":["zai-org-glm-5-1"],"active":true},
 				{"id":"gemini-3-5-flash","active":true},
 				{"id":"retired-in-web","active":false}]},

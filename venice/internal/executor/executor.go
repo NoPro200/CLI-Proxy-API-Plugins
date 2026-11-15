@@ -233,6 +233,9 @@ func buildVeniceRequest(req pluginapi.ExecutorRequest) (openAIRequest, []byte, s
 // buildVeniceBody turns an OpenAI chat request into a Venice web chat payload.
 func buildVeniceBody(openReq openAIRequest, veniceModel string) ([]byte, error) {
 	systemPrompt, prompt := splitMessages(openReq)
+	mode, known := models.Reasoning(veniceModel)
+	reasoning, prefix := reasoningFor(openReq, mode, known)
+	prompt = prefixLastUserMessage(prompt, prefix)
 	temperature := openReq.Temperature
 	if temperature == nil {
 		temperature = 0.6
@@ -250,7 +253,7 @@ func buildVeniceBody(openReq openAIRequest, veniceModel string) ([]byte, error) 
 		"isCharacter":                  false,
 		"modelId":                      veniceModel,
 		"prompt":                       prompt,
-		"reasoning":                    true,
+		"reasoning":                    reasoning,
 		"requestId":                    randomID(),
 		"simpleMode":                   false,
 		"systemPrompt":                 systemPrompt,
@@ -295,18 +298,43 @@ func splitMessages(req openAIRequest) (string, []map[string]string) {
 	if instructions := toolInstructions(req); instructions != "" {
 		systemParts = append(systemParts, instructions)
 	}
-	return strings.Join(systemParts, "\n\n"), maybePrefixReasoning(prompt, len(req.Tools) == 0)
+	return strings.Join(systemParts, "\n\n"), prompt
 }
 
-func maybePrefixReasoning(prompt []map[string]string, enabled bool) []map[string]string {
-	if !enabled {
+// reasoningFor decides like Venice's web app: reasoning is on unless the client
+// sent reasoning effort "none". Models that reason without a switch stay on,
+// and models with a switch get "/think" or "/no_think" before the last user message.
+func reasoningFor(req openAIRequest, mode models.ReasoningMode, known bool) (bool, string) {
+	on := !strings.EqualFold(strings.TrimSpace(req.ReasoningEffort), "none")
+	if !known {
+		return on, ""
+	}
+	on = (on || mode.Supported && !mode.Toggle) && !mode.ForceOff && (mode.Supported || mode.Toggle)
+	if !mode.Toggle || mode.ForwardEncrypted || mode.ForceOff {
+		return on, ""
+	}
+	if !on {
+		return false, "/no_think "
+	}
+	// Tool requests keep their prompt as before unless reasoning is switched off.
+	if len(req.Tools) > 0 {
+		return true, ""
+	}
+	return true, "/think "
+}
+
+func prefixLastUserMessage(prompt []map[string]string, prefix string) []map[string]string {
+	if prefix == "" {
 		return prompt
 	}
 	for i := len(prompt) - 1; i >= 0; i-- {
-		if prompt[i]["role"] == "user" && !strings.HasPrefix(prompt[i]["content"], "/think ") {
-			prompt[i]["content"] = "/think " + prompt[i]["content"]
-			break
+		if prompt[i]["role"] != "user" {
+			continue
 		}
+		if content := prompt[i]["content"]; !strings.HasPrefix(content, "/think ") && !strings.HasPrefix(content, "/no_think ") {
+			prompt[i]["content"] = prefix + content
+		}
+		break
 	}
 	return prompt
 }

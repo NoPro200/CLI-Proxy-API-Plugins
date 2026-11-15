@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/trungking/cpa-plugin-venice/internal/models"
 )
 
 func TestBuildVeniceRequestFromOpenAIChat(t *testing.T) {
@@ -39,11 +40,50 @@ func TestBuildVeniceRequestFromOpenAIChat(t *testing.T) {
 	}
 	prompt := body["prompt"].([]any)
 	last := prompt[len(prompt)-1].(map[string]any)
-	if last["content"] != "/think Say hi" {
-		t.Fatalf("last content = %#v", last["content"])
+	// Without a web model list nothing says the model has a reasoning switch, so no /think.
+	if last["content"] != "Say hi" || body["reasoning"] != true {
+		t.Fatalf("last content = %#v, reasoning = %#v", last["content"], body["reasoning"])
 	}
 	if body["includeVeniceSystemPrompt"] != false {
 		t.Fatalf("includeVeniceSystemPrompt = %#v", body["includeVeniceSystemPrompt"])
+	}
+}
+
+func TestReasoningForMirrorsTheWebApp(t *testing.T) {
+	plain := openAIRequest{ReasoningEffort: "xhigh"}
+	none := openAIRequest{ReasoningEffort: "none"}
+	withTools := openAIRequest{Tools: []json.RawMessage{json.RawMessage(`{}`)}}
+	noneWithTools := openAIRequest{ReasoningEffort: "None", Tools: withTools.Tools}
+	toggle := models.ReasoningMode{Supported: true, Toggle: true}
+	always := models.ReasoningMode{Supported: true}
+	cases := []struct {
+		name       string
+		req        openAIRequest
+		mode       models.ReasoningMode
+		known      bool
+		wantOn     bool
+		wantPrefix string
+	}{
+		{"no web list, effort set", plain, models.ReasoningMode{}, false, true, ""},
+		{"no web list, none", none, models.ReasoningMode{}, false, false, ""},
+		{"switch, on", plain, toggle, true, true, "/think "},
+		{"switch, none", none, toggle, true, false, "/no_think "},
+		{"switch, tools keep their prompt", withTools, toggle, true, true, ""},
+		{"switch, none with tools", noneWithTools, toggle, true, false, "/no_think "},
+		{"no switch stays on", none, always, true, true, ""},
+		{"forced off", plain, models.ReasoningMode{Supported: true, Toggle: true, ForceOff: true}, true, false, ""},
+		{"encrypted reasoning gets no prefix", none, models.ReasoningMode{Supported: true, Toggle: true, ForwardEncrypted: true}, true, false, ""},
+		{"model without reasoning", plain, models.ReasoningMode{}, true, false, ""},
+	}
+	for _, tc := range cases {
+		on, prefix := reasoningFor(tc.req, tc.mode, tc.known)
+		if on != tc.wantOn || prefix != tc.wantPrefix {
+			t.Errorf("%s: reasoningFor = %v, %q; want %v, %q", tc.name, on, prefix, tc.wantOn, tc.wantPrefix)
+		}
+	}
+	prompt := prefixLastUserMessage([]map[string]string{{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}, {"role": "user", "content": "c"}}, "/no_think ")
+	if prompt[0]["content"] != "a" || prompt[2]["content"] != "/no_think c" {
+		t.Fatalf("prefixed prompt = %#v", prompt)
 	}
 }
 

@@ -9,17 +9,33 @@ import (
 	authpkg "github.com/trungking/cpa-plugin-venice/internal/auth"
 )
 
-// webIDs maps API model ids to the ids the Venice web app uses, per kind. It
-// stays nil until a web model list arrived and keeps the last one when a later
-// fetch fails.
+// webIDs holds what the Venice web app's model list says. It stays nil until a
+// web model list arrived and keeps the last one when a later fetch fails.
 // shortcut: one index for all accounts; web lists differ per plan, so split it per auth once free and paid accounts are mixed.
-var webIDs atomic.Pointer[map[string]map[string]string]
+var webIDs atomic.Pointer[webIndex]
+
+type webIndex struct {
+	ids       map[string]map[string]string // kind -> API model id -> web id
+	reasoning map[string]ReasoningMode     // web id of a text model -> its reasoning switches
+}
+
+// ReasoningMode is how the Venice web app runs reasoning for a text model.
+type ReasoningMode struct {
+	Supported        bool // the model reasons
+	Toggle           bool // users can switch reasoning on and off
+	ForceOff         bool // reasoning is always off
+	ForwardEncrypted bool // the web app sends no /think or /no_think for it
+}
 
 type webModel struct {
-	ID         string   `json:"id"`
-	APIModelID string   `json:"apiModelId"`
-	AliasIDs   []string `json:"aliasIds"`
-	Active     *bool    `json:"active"`
+	ID                        string   `json:"id"`
+	APIModelID                string   `json:"apiModelId"`
+	AliasIDs                  []string `json:"aliasIds"`
+	Active                    *bool    `json:"active"`
+	SupportsReasoning         bool     `json:"supportsReasoning"`
+	SupportsReasonToggle      bool     `json:"supportsReasonToggle"`
+	ForceDisableReasoning     bool     `json:"forceDisableReasoning"`
+	ForwardEncryptedReasoning bool     `json:"forwardEncryptedReasoning"`
 }
 
 type webModelGroup struct {
@@ -34,7 +50,7 @@ func WebID(kind, apiID string) (string, bool) {
 	if index == nil {
 		return apiID, true
 	}
-	ids, known := (*index)[kind]
+	ids, known := index.ids[kind]
 	if !known {
 		return apiID, true
 	}
@@ -42,6 +58,17 @@ func WebID(kind, apiID string) (string, bool) {
 		return id, true
 	}
 	return apiID, false
+}
+
+// Reasoning returns the reasoning switches of a text model by its web id. ok is
+// false until a web model list arrived or when the list lacks the model.
+func Reasoning(webID string) (ReasoningMode, bool) {
+	index := webIDs.Load()
+	if index == nil {
+		return ReasoningMode{}, false
+	}
+	mode, ok := index.reasoning[webID]
+	return mode, ok
 }
 
 func refreshWebIDs(ctx context.Context, client pluginapi.HostHTTPClient, storageJSON []byte) {
@@ -53,12 +80,12 @@ func refreshWebIDs(ctx context.Context, client pluginapi.HostHTTPClient, storage
 	if errFetch != nil {
 		return
 	}
-	if index := indexWebModels(body); len(index) > 0 {
-		webIDs.Store(&index)
+	if index := indexWebModels(body); index != nil && len(index.ids) > 0 {
+		webIDs.Store(index)
 	}
 }
 
-func indexWebModels(body []byte) map[string]map[string]string {
+func indexWebModels(body []byte) *webIndex {
 	var catalog struct {
 		Text    webModelGroup `json:"text"`
 		Image   webModelGroup `json:"image"`
@@ -67,7 +94,7 @@ func indexWebModels(body []byte) map[string]map[string]string {
 	if json.Unmarshal(body, &catalog) != nil {
 		return nil
 	}
-	index := make(map[string]map[string]string)
+	index := &webIndex{ids: make(map[string]map[string]string), reasoning: make(map[string]ReasoningMode)}
 	for kind, group := range map[string]webModelGroup{TextKind: catalog.Text, ImageKind: catalog.Image, EditKind: catalog.Inpaint} {
 		usable := make([]webModel, 0, len(group.Models))
 		for _, model := range group.Models {
@@ -89,10 +116,18 @@ func indexWebModels(body []byte) map[string]map[string]string {
 		}
 		for _, model := range usable {
 			ids[model.ID] = model.ID
+			if kind == TextKind {
+				index.reasoning[model.ID] = ReasoningMode{
+					Supported:        model.SupportsReasoning,
+					Toggle:           model.SupportsReasonToggle,
+					ForceOff:         model.ForceDisableReasoning,
+					ForwardEncrypted: model.ForwardEncryptedReasoning,
+				}
+			}
 		}
 		// An empty kind stays unknown, so a changed web list cannot hide every model of it.
 		if len(ids) > 0 {
-			index[kind] = ids
+			index.ids[kind] = ids
 		}
 	}
 	return index
