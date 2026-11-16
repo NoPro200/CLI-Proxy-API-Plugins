@@ -164,24 +164,35 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "ARCHIVE_NAME=${PLUGIN_ID}_${VERSION}_windows_arm64.zip" >> "${GITHUB_ENV}"
 
+      # go-cross/cgo-actions installs Zig only via `snap install zig --beta`, which kept
+      # failing on the runners (2026-11-16); the release tarball is the same Zig without snap.
+      - name: Install Zig
+        working-directory: ${{ runner.temp }}
+        env:
+          ZIG_VERSION: 0.17.1
+          ZIG_SHA256: 3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          echo "${ZIG_SHA256}  zig.tar.xz" | sha256sum -c -
+          tar -xJf zig.tar.xz
+          echo "${RUNNER_TEMP}/zig-x86_64-linux-${ZIG_VERSION}" >> "${GITHUB_PATH}"
+
       - name: Build Windows ARM64 shared library
         timeout-minutes: 45
-        uses: go-cross/cgo-actions@v1
-        env:
-          GOFLAGS: -trimpath -buildmode=c-shared
-        with:
-          dir: ${{ matrix.plugin.dir }}
-          packages: ${{ matrix.plugin.cmd }}
-          targets: windows-arm64
-          out-dir: ${{ github.workspace }}/${{ matrix.plugin.dir }}/dist/windows-arm64
-          output: ${{ env.PLUGIN_ID }}.dll
-          flags: -ldflags=-s -w
-          x-flags: main.pluginVersion=${{ steps.release_metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/windows-arm64
+          CGO_ENABLED=1 GOOS=windows GOARCH=arm64 \
+          CC="zig cc -target aarch64-windows-gnu" CXX="zig c++ -target aarch64-windows-gnu" \
+            go build -trimpath -buildmode=c-shared \
+              -ldflags "-s -w -X main.pluginVersion=${VERSION}" \
+              -o "dist/windows-arm64/${PLUGIN_ID}.dll" ${{ matrix.plugin.cmd }}
 
       - name: Package plugin
         run: |
           set -euo pipefail
-          rm -f go-cross-bin.h "dist/windows-arm64/${PLUGIN_ID}.h"
+          rm -f "dist/windows-arm64/${PLUGIN_ID}.h"
           go run ./tools/package-release \
             -library "dist/windows-arm64/${PLUGIN_ID}.dll" \
             -archive "${ARCHIVE_NAME}" \
