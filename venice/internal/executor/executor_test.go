@@ -494,15 +494,116 @@ func TestStreamRepairsCutToolCall(t *testing.T) {
 	in <- pluginapi.HTTPStreamChunk{Payload: []byte(`{"kind":"meta","completion_id":"upstream-id"}` + "\n")}
 	close(in)
 	req := openAIRequest{Tools: []json.RawMessage{json.RawMessage(`{"type":"function","function":{"name":"list_files"}}`)}}
-	repair := func(context.Context, string) (string, bool) {
+	ask := func(context.Context, string, string) (string, bool) {
 		return `{"tool_calls":[{"name":"list_files","arguments":{}}]}`, true
 	}
 	var frames []string
-	for chunk := range openAIStreamChunksWithMonitor(context.Background(), in, "m", req, nil, repair) {
+	for chunk := range openAIStreamChunksWithMonitor(context.Background(), in, "m", req, nil, ask) {
 		frames = append(frames, string(chunk.Payload))
 	}
 	joined := strings.Join(frames, "")
 	if !strings.Contains(joined, `"finish_reason":"tool_calls"`) || !strings.Contains(joined, `"name":"list_files"`) {
 		t.Fatalf("stream = %s, want the repaired tool call", joined)
+	}
+}
+
+// finalAnswerPayload is OpenWebUI's last request of a tool loop: tool results in
+// the history, tools switched off.
+const finalAnswerPayload = `{"model":"m","tool_choice":"none","messages":[
+	{"role":"user","content":"Liste /root"},
+	{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"list_files","arguments":"{}"}}]},
+	{"role":"tool","tool_call_id":"c1","content":"a b"},
+	{"role":"system","content":"Tool use has stopped for this response."}]}`
+
+func TestExecuteReplacesToolCallInFinalAnswer(t *testing.T) {
+	client := &queuedClient{bodies: []string{
+		`{"kind":"content","content":"Noch ein Blick:\n\n{\"tool_calls\":[{\"name\":\"list_files\",\"arguments\":{\"path\":\"/root/a\"}}]}"}`,
+		`{"kind":"content","content":"In /root liegen a und b."}`,
+	}}
+	resp, err := NewExecutor().Execute(context.Background(), pluginapi.ExecutorRequest{
+		Model: "m", Payload: []byte(finalAnswerPayload), StorageJSON: []byte(freshStorage), HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if len(client.requests) != 2 {
+		t.Fatalf("requests = %d, want the answer plus one plain-text retry", len(client.requests))
+	}
+	var retry map[string]any
+	if err := json.Unmarshal(client.requests[1], &retry); err != nil {
+		t.Fatalf("decode retry: %v", err)
+	}
+	prompt := retry["prompt"].([]any)
+	if last := prompt[len(prompt)-1].(map[string]any); last["content"] != finalAnswerPrompt {
+		t.Fatalf("retry prompt = %#v", last)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(resp.Payload, &body); err != nil {
+		t.Fatalf("decode output: %v", err)
+	}
+	choice := body["choices"].([]any)[0].(map[string]any)
+	if choice["finish_reason"] != "stop" || choice["message"].(map[string]any)["content"] != "In /root liegen a und b." {
+		t.Fatalf("choice = %#v, want the plain answer", choice)
+	}
+}
+
+func TestStreamReplacesToolCallInFinalAnswer(t *testing.T) {
+	var req openAIRequest
+	if err := json.Unmarshal([]byte(finalAnswerPayload), &req); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	line, _ := json.Marshal(map[string]string{"kind": "content", "content": brokenCallTool[:strings.Index(brokenCallTool, "\n")]})
+	in := make(chan pluginapi.HTTPStreamChunk, 1)
+	in <- pluginapi.HTTPStreamChunk{Payload: append(line, '\n')}
+	close(in)
+	var prompts []string
+	ask := func(_ context.Context, _ string, prompt string) (string, bool) {
+		prompts = append(prompts, prompt)
+		return "Hier ist der Stand.", true
+	}
+	var frames []string
+	for chunk := range openAIStreamChunksWithMonitor(context.Background(), in, "m", req, nil, ask) {
+		frames = append(frames, string(chunk.Payload))
+	}
+	joined := strings.Join(frames, "")
+	if len(prompts) != 1 || prompts[0] != finalAnswerPrompt || !strings.Contains(joined, "Hier ist der Stand.") || strings.Contains(joined, "tool_calls") {
+		t.Fatalf("prompts = %q, stream = %s", prompts, joined)
+	}
+	// Without tool results in the history a request without tools streams as before.
+	if finalAnswerTurn(openAIRequest{ToolChoice: "none", Messages: []openAIMessage{{Role: "user", Content: "hi"}}}) {
+		t.Fatal("a plain chat is not a final-answer turn")
+	}
+}
+
+func TestCallToolParamsReachOpenWebUIAsValidJSON(t *testing.T) {
+	cases := []struct {
+		name, params, command string
+	}{
+		// A heredoc with raw line breaks and a regex backslash the model did not double.
+		{"line breaks", "{\"command\":\"cat > /tmp/p.sh <<'EOF'\ngrep -oE 'host\\.example' log\nEOF\"}", "cat > /tmp/p.sh <<'EOF'\ngrep -oE 'host\\.example' log\nEOF"},
+		// Quotes of the shell command left unescaped inside the JSON string.
+		{"quotes", `{"command": "ssh host "grep -n 'key' /tmp/r.txt | head -10; echo ==="", "wait": "30"}`, `ssh host "grep -n 'key' /tmp/r.txt | head -10; echo ==="`},
+		// A valid object with a stray ] behind it, as if closing the calls array.
+		{"trailing bracket", `{"command":"curl -s -w \"%{http_code}\\n\" https://example.org","wait":"60"}]`, `curl -s -w "%{http_code}\n" https://example.org`},
+	}
+	for _, tc := range cases {
+		fixed, _ := paramsString(tc.params).(string)
+		var decoded map[string]any
+		if err := json.Unmarshal([]byte(fixed), &decoded); err != nil || decoded["command"] != tc.command {
+			t.Errorf("%s: params = %s (%v), command = %q", tc.name, fixed, err, decoded["command"])
+		}
+	}
+	if broken := `{"command": "ls`; paramsString(broken) != broken {
+		t.Error("params that cannot be mended must stay as they are")
+	}
+	// The single form with params as an object, and the wrapper key used as tool name.
+	for _, text := range []string{
+		`{"tool_calls":[{"name":"call_tool","arguments":{"tool_name":"run_command","params":{"command":"ls"}}}]}`,
+		`{"tool_calls":[{"name":"tool_calls","arguments":{"calls":[{"tool_name":"run_command","params":{"command":"ls"}}]}}]}`,
+	} {
+		calls, ok := parseToolCalls(text)
+		if !ok || calls[0].Function.Name != "call_tool" || !strings.Contains(calls[0].Function.Arguments, `"params":"{\"command\":\"ls\"}"`) {
+			t.Errorf("%s: calls = %#v", text, calls)
+		}
 	}
 }

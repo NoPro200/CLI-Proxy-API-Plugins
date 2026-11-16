@@ -105,11 +105,9 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 		return pluginapi.ExecutorResponse{}, errStatus
 	}
 	content, reasoning, upstreamID := collectVeniceText(resp.Body)
-	if needsToolRepair(openReq, content) {
-		if repaired, ok := repairToolCall(ctx, req.HTTPClient, *storage, model, openReq, content); ok {
-			content = repaired
-		}
-	}
+	content = repairAnswer(ctx, openReq, content, func(ctx context.Context, partial, prompt string) (string, bool) {
+		return askAgain(ctx, req.HTTPClient, *storage, model, openReq, partial, prompt)
+	})
 	payload := openAICompletion(content, reasoning, upstreamID, model, openReq)
 	usage := usageFromOpenAIResponse(payload)
 	span.Finish(monitor.Result{Success: true, OutputTokens: usage.OutputTokens, TotalTokens: usage.TotalTokens})
@@ -155,12 +153,12 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 		span.Finish(monitor.Result{Success: false, Error: errStatus.Error()})
 		return pluginapi.ExecutorStreamResponse{}, errStatus
 	}
-	repair := func(ctx context.Context, partial string) (string, bool) {
-		return repairToolCall(ctx, req.HTTPClient, *storage, model, openReq, partial)
+	ask := func(ctx context.Context, partial, prompt string) (string, bool) {
+		return askAgain(ctx, req.HTTPClient, *storage, model, openReq, partial, prompt)
 	}
 	return pluginapi.ExecutorStreamResponse{
 		Headers: http.Header{"Content-Type": []string{"text/event-stream"}},
-		Chunks:  openAIStreamChunksWithMonitor(ctx, resp.Chunks, model, openReq, span, repair),
+		Chunks:  openAIStreamChunksWithMonitor(ctx, resp.Chunks, model, openReq, span, ask),
 	}, nil
 }
 
@@ -457,15 +455,62 @@ func looksLikeToolCallAttempt(text string) bool {
 		(strings.Contains(text, `"name"`) && strings.Contains(text, `"arguments"`))
 }
 
-// repairToolCall asks Venice once more for a tool call it cut off and returns the
-// new answer only when it holds a parsable call.
-func repairToolCall(ctx context.Context, client pluginapi.HostHTTPClient, storage authpkg.Storage, model string, req openAIRequest, partial string) (string, bool) {
+const finalAnswerPrompt = `Tool calls are switched off for this reply and would be lost. Answer the user now in plain text with the tool results you already have, and say briefly what is still open.`
+
+// finalAnswerTurn spots OpenWebUI's last request of a tool loop: after tool
+// results it switches tools off and asks for an answer.
+func finalAnswerTurn(req openAIRequest) bool {
+	if len(req.Tools) > 0 || req.ToolChoice != "none" {
+		return false
+	}
+	for _, message := range req.Messages {
+		if message.Role == "tool" || len(message.ToolCalls) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// needsFinalAnswer spots a tool call in a final-answer turn. Models still write
+// one there, and without tools in the request it reaches the user as raw text.
+func needsFinalAnswer(req openAIRequest, content string) bool {
+	if !finalAnswerTurn(req) {
+		return false
+	}
+	if _, ok := parseToolCalls(content); ok {
+		return true
+	}
+	return looksLikeToolCallAttempt(strings.TrimSpace(content))
+}
+
+// repairAnswer gives an unusable answer one more round with Venice: a tool call
+// it cut off is asked for again, and a tool call in a final-answer turn is
+// replaced by a plain answer. Without a better answer the original stays.
+func repairAnswer(ctx context.Context, req openAIRequest, content string, ask func(context.Context, string, string) (string, bool)) string {
+	switch {
+	case needsToolRepair(req, content):
+		if again, ok := ask(ctx, content, toolRepairPrompt); ok {
+			if _, parsed := parseToolCalls(again); parsed {
+				return again
+			}
+		}
+	case needsFinalAnswer(req, content):
+		if again, ok := ask(ctx, content, finalAnswerPrompt); ok && strings.TrimSpace(again) != "" && !needsFinalAnswer(req, again) {
+			return again
+		}
+	}
+	return content
+}
+
+// askAgain sends the conversation once more with the unusable answer and a
+// correction prompt and returns Venice's new answer.
+func askAgain(ctx context.Context, client pluginapi.HostHTTPClient, storage authpkg.Storage, model string, req openAIRequest, partial, prompt string) (string, bool) {
 	retry := req
 	retry.Messages = append([]openAIMessage(nil), req.Messages...)
 	if strings.TrimSpace(partial) != "" {
 		retry.Messages = append(retry.Messages, openAIMessage{Role: "assistant", Content: partial})
 	}
-	retry.Messages = append(retry.Messages, openAIMessage{Role: "user", Content: toolRepairPrompt})
+	retry.Messages = append(retry.Messages, openAIMessage{Role: "user", Content: prompt})
 	body, errBody := buildVeniceBody(retry, model)
 	if errBody != nil {
 		return "", false
@@ -480,9 +525,6 @@ func repairToolCall(ctx context.Context, client pluginapi.HostHTTPClient, storag
 		return "", false
 	}
 	content, _, _ := collectVeniceText(resp.Body)
-	if _, ok := parseToolCalls(content); !ok {
-		return "", false
-	}
 	return content, true
 }
 
@@ -549,8 +591,9 @@ func openAIStreamChunks(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk
 	return openAIStreamChunksWithMonitor(ctx, in, model, req, nil, nil)
 }
 
-// repair, when set, gets one chance to recover a tool call Venice cut off.
-func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk, model string, req openAIRequest, span *monitor.Span, repair func(context.Context, string) (string, bool)) <-chan pluginapi.ExecutorStreamChunk {
+// ask, when set, asks Venice once more for an unusable answer (see repairAnswer).
+// Answers that may need it are buffered: those with tools and final-answer turns.
+func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk, model string, req openAIRequest, span *monitor.Span, ask func(context.Context, string, string) (string, bool)) <-chan pluginapi.ExecutorStreamChunk {
 	out := make(chan pluginapi.ExecutorStreamChunk)
 	go func() {
 		defer close(out)
@@ -558,6 +601,7 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 		created := time.Now().Unix()
 		content := strings.Builder{}
 		reasoning := strings.Builder{}
+		buffered := len(req.Tools) > 0 || finalAnswerTurn(req)
 		emit := func(payload map[string]any) bool {
 			raw, _ := json.Marshal(payload)
 			select {
@@ -581,17 +625,15 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 			case chunk, ok := <-in:
 				if !ok {
 					final := content.String()
-					if repair != nil && needsToolRepair(req, final) {
-						if repaired, okRepair := repair(ctx, final); okRepair {
-							final = repaired
-						}
+					if ask != nil && buffered {
+						final = repairAnswer(ctx, req, final, ask)
 					}
 					promptTokens := estimateRequestTokens(req)
 					completionTokens := estimateTokens(final) + estimateTokens(reasoning.String())
-					if len(req.Tools) > 0 && !emitBufferedToolAwareStream(emit, streamID, created, model, req, final, reasoning.String()) {
+					if buffered && !emitBufferedToolAwareStream(emit, streamID, created, model, req, final, reasoning.String()) {
 						return
 					}
-					if len(req.Tools) == 0 && !emit(openAIStreamPayload(streamID, created, model, map[string]any{}, "stop")) {
+					if !buffered && !emit(openAIStreamPayload(streamID, created, model, map[string]any{}, "stop")) {
 						return
 					}
 					if !emit(openAIStreamUsagePayload(streamID, created, model, openAIUsage(promptTokens, completionTokens))) {
@@ -627,7 +669,7 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 					if event.isInitialProcessingStatus(content.Len() == 0 && reasoning.Len() == 0) {
 						continue
 					}
-					if len(req.Tools) > 0 {
+					if buffered {
 						if event.Content != "" || event.ReasoningContent != "" {
 							if span != nil {
 								span.MarkTTFT()
@@ -895,9 +937,8 @@ func parseBrokenCallToolCalls(text string) ([]openAIToolCall, bool) {
 	var calls []any
 	seen := make(map[string]bool)
 	for _, match := range callToolEntry.FindAllStringSubmatchIndex(text, -1) {
-		var params map[string]any
-		// The decoder stops after the object, so the broken quoting behind it does not matter.
-		if json.NewDecoder(strings.NewReader(text[match[1]:])).Decode(&params) != nil {
+		params, ok := decodeLeadingObject(text[match[1]:])
+		if !ok {
 			return nil, false
 		}
 		raw, _ := json.Marshal(params)
@@ -914,32 +955,112 @@ func parseBrokenCallToolCalls(text string) ([]openAIToolCall, bool) {
 	return []openAIToolCall{call}, ok
 }
 
-// encodeCallToolParams turns params objects into the JSON strings call_tool
-// expects, because models are told to send the object rather than escape it.
-func encodeCallToolParams(args any) any {
-	if text, ok := args.(string); ok {
-		var decoded map[string]any
-		if json.Unmarshal([]byte(text), &decoded) != nil {
-			return args
+// decodeLeadingObject reads the JSON object at the start of text and ignores what
+// follows it. The decoder stops after the object, so broken quoting behind it
+// does not matter; JSON the model broke inside the object gets mended once.
+func decodeLeadingObject(text string) (map[string]any, bool) {
+	for _, candidate := range []string{text, repairNestedJSON(text)} {
+		var object map[string]any
+		if json.NewDecoder(strings.NewReader(candidate)).Decode(&object) == nil {
+			return object, true
 		}
-		args = decoded
 	}
-	argsMap, ok := args.(map[string]any)
+	return nil, false
+}
+
+// encodeCallToolParams prepares call_tool arguments for OpenWebUI, which parses
+// every params value as a JSON object inside a string, in the batch form
+// ({"calls":[...]}) and in the single form ({"tool_name":...,"params":...}).
+func encodeCallToolParams(args any) any {
+	argsMap, ok := toolArgsMap(args)
 	if !ok {
 		return args
 	}
-	calls, _ := argsMap["calls"].([]any)
-	for _, call := range calls {
-		item, ok := call.(map[string]any)
-		if !ok || item["params"] == nil {
-			continue
+	if calls, isBatch := argsMap["calls"].([]any); isBatch {
+		for _, call := range calls {
+			if item, isMap := call.(map[string]any); isMap && item["params"] != nil {
+				item["params"] = paramsString(item["params"])
+			}
 		}
-		if _, isString := item["params"].(string); !isString {
-			raw, _ := json.Marshal(item["params"])
-			item["params"] = string(raw)
-		}
+	} else if argsMap["params"] != nil {
+		argsMap["params"] = paramsString(argsMap["params"])
 	}
 	return argsMap
+}
+
+func toolArgsMap(args any) (map[string]any, bool) {
+	if text, ok := args.(string); ok {
+		var decoded map[string]any
+		if json.Unmarshal([]byte(text), &decoded) != nil {
+			return nil, false
+		}
+		return decoded, true
+	}
+	argsMap, ok := args.(map[string]any)
+	return argsMap, ok
+}
+
+// paramsString returns params as the JSON string OpenWebUI expects. Models send
+// the object itself, as they are told, or break the JSON inside the string, for
+// example with a stray ] behind it; a params string OpenWebUI cannot parse fails
+// the call.
+func paramsString(params any) any {
+	text, isString := params.(string)
+	if isString && json.Valid([]byte(text)) {
+		return text
+	}
+	if isString {
+		object, ok := decodeLeadingObject(text)
+		if !ok {
+			return text
+		}
+		params = object
+	}
+	raw, _ := json.Marshal(params)
+	return string(raw)
+}
+
+// repairNestedJSON mends how models break JSON they write inside a JSON string:
+// raw line breaks and tabs in string values (heredocs), quotes they did not
+// escape, and backslashes they meant literally (such as \. in a regex). A quote
+// ends a string only when a delimiter follows it.
+func repairNestedJSON(text string) string {
+	var out strings.Builder
+	inString := false
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if !inString {
+			out.WriteByte(c)
+			inString = c == '"'
+			continue
+		}
+		switch c {
+		case '\\':
+			if i+1 < len(text) && strings.IndexByte(`"\/bfnrtu`, text[i+1]) >= 0 {
+				out.WriteByte(c)
+				i++
+				out.WriteByte(text[i])
+			} else {
+				out.WriteString(`\\`)
+			}
+		case '"':
+			if rest := strings.TrimLeft(text[i+1:], " \t\r\n"); rest == "" || strings.IndexByte(",:}]", rest[0]) >= 0 {
+				inString = false
+				out.WriteByte(c)
+			} else {
+				out.WriteString(`\"`)
+			}
+		case '\n':
+			out.WriteString(`\n`)
+		case '\r':
+			out.WriteString(`\r`)
+		case '\t':
+			out.WriteString(`\t`)
+		default:
+			out.WriteByte(c)
+		}
+	}
+	return out.String()
 }
 
 // DeepSeek ignores the JSON instruction and writes tool calls in its own DSML
@@ -1114,6 +1235,12 @@ func normalizeToolCall(value any, _ int) (openAIToolCall, bool) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return openAIToolCall{}, false
+	}
+	// Models sometimes take the wrapper key for the tool name of a call_tool call.
+	if name == "tool_calls" {
+		if argsMap, ok := toolArgsMap(args); ok && (argsMap["calls"] != nil || argsMap["tool_name"] != nil) {
+			name = callToolName
+		}
 	}
 	if name == callToolName {
 		args = encodeCallToolParams(args)
