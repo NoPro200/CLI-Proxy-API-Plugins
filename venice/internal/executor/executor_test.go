@@ -397,6 +397,43 @@ func TestParseToolCallsReadsDeepSeekDSML(t *testing.T) {
 	}
 }
 
+// brokenCallTool has the shape of a DeepSeek answer in an OpenWebUI terminal chat:
+// the params object sits unescaped in a string, a ] replaces its closing quote,
+// and the answer repeats the call.
+const brokenCallTool = `{"tool_calls":[{"name":"call_tool","arguments":{"calls":[{"tool_name":"run_command","params":"{"command": "ssh host 'docker ps --format \"{{.Names}} | {{.Status}}\" 2>&1'", "wait": "30"}]}]}}]}
+
+{"tool_calls":[{"name":"call_tool","arguments":{"calls":[{"tool_name":"run_command","params":"{"command": "ssh host 'docker ps --format \"{{.Names}} | {{.Status}}\" 2>&1'", "wait": "30"}]}]}}]}`
+
+func TestParseToolCallsRescuesBrokenCallTool(t *testing.T) {
+	calls, ok := parseToolCalls(brokenCallTool)
+	if !ok || len(calls) != 1 || calls[0].Function.Name != "call_tool" {
+		t.Fatalf("calls = %#v, ok = %v", calls, ok)
+	}
+	var args struct {
+		Calls []struct {
+			ToolName string `json:"tool_name"`
+			Params   string `json:"params"`
+		} `json:"calls"`
+	}
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil || len(args.Calls) != 1 || args.Calls[0].ToolName != "run_command" {
+		t.Fatalf("arguments = %s (%v)", calls[0].Function.Arguments, err)
+	}
+	var params map[string]string
+	if err := json.Unmarshal([]byte(args.Calls[0].Params), &params); err != nil || params["command"] != `ssh host 'docker ps --format "{{.Names}} | {{.Status}}" 2>&1'` || params["wait"] != "30" {
+		t.Fatalf("params = %s (%v)", args.Calls[0].Params, err)
+	}
+	// Models are told to send params as an object; OpenWebUI still gets the JSON string it expects.
+	calls, ok = parseToolCalls(`{"tool_calls":[{"name":"call_tool","arguments":{"calls":[{"tool_name":"list_files","params":{"path":"/root"}}]}}]}`)
+	if !ok || !strings.Contains(calls[0].Function.Arguments, `"params":"{\"path\":\"/root\"}"`) {
+		t.Fatalf("object params = %#v", calls)
+	}
+	callTool := openAIRequest{Tools: []json.RawMessage{json.RawMessage(`{"type":"function","function":{"name":"call_tool"}}`)}}
+	listFiles := openAIRequest{Tools: []json.RawMessage{json.RawMessage(`{"type":"function","function":{"name":"list_files"}}`)}}
+	if !strings.Contains(toolInstructions(callTool), `write each "params" value as a plain JSON object`) || strings.Contains(toolInstructions(listFiles), "call_tool") {
+		t.Fatal("the params hint belongs exactly to requests offering call_tool")
+	}
+}
+
 func TestExecuteRepairsCutToolCall(t *testing.T) {
 	client := &queuedClient{bodies: []string{
 		cutLeadIn,

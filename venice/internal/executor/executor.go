@@ -391,18 +391,37 @@ func toolInstructions(req openAIRequest) string {
 	}
 	toolsRaw, _ := json.Marshal(req.Tools)
 	choiceRaw, _ := json.Marshal(req.ToolChoice)
+	hint := ""
+	if offersTool(req, callToolName) {
+		hint = "\nFor call_tool, write each \"params\" value as a plain JSON object, not as a string; it is encoded for you."
+	}
 	return strings.TrimSpace(fmt.Sprintf(`Tool calling is available.
 When you need a tool, respond with exactly one JSON object and no markdown, no prose, and no surrounding text:
 {"tool_calls":[{"name":"tool_name","arguments":{}}]}
 The "name" must exactly match one available tool name. The "arguments" value must be a JSON object matching that tool schema.
-Never use <tool_call> tags or any other tool-call syntax; such calls are lost.
+Never use <tool_call> tags or any other tool-call syntax; such calls are lost.%s
 After tool results are provided in later messages, answer normally or request another tool with the same JSON format.
 
 Available tools:
 %s
 
 tool_choice:
-%s`, string(toolsRaw), string(choiceRaw)))
+%s`, hint, string(toolsRaw), string(choiceRaw)))
+}
+
+func offersTool(req openAIRequest, name string) bool {
+	for _, raw := range req.Tools {
+		var tool struct {
+			Name     string `json:"name"`
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		}
+		if json.Unmarshal(raw, &tool) == nil && (tool.Function.Name == name || tool.Name == name) {
+			return true
+		}
+	}
+	return false
 }
 
 func aggregateOpenAIResponse(body []byte, model string, req openAIRequest) []byte {
@@ -853,7 +872,74 @@ func parseToolCalls(text string) ([]openAIToolCall, bool) {
 			return calls, true
 		}
 	}
-	return parseDSMLToolCalls(text)
+	if calls, ok := parseDSMLToolCalls(text); ok {
+		return calls, true
+	}
+	return parseBrokenCallToolCalls(text)
+}
+
+// callToolName is OpenWebUI's tool for invoking deferred tools. It takes each
+// entry's params as a JSON-encoded object, which models must escape inside a string.
+const callToolName = "call_tool"
+
+// callToolEntry finds the tool_name and params of each entry in a call_tool call.
+var callToolEntry = regexp.MustCompile(`"tool_name"\s*:\s*"([^"]+)"\s*,\s*"params"\s*:\s*"?`)
+
+// parseBrokenCallToolCalls rescues call_tool calls that are invalid JSON because
+// the params object sits in a string unescaped, as DeepSeek writes commands full
+// of quotes. Identical entries count once, since such answers often repeat the call.
+func parseBrokenCallToolCalls(text string) ([]openAIToolCall, bool) {
+	if !strings.Contains(text, `"`+callToolName+`"`) {
+		return nil, false
+	}
+	var calls []any
+	seen := make(map[string]bool)
+	for _, match := range callToolEntry.FindAllStringSubmatchIndex(text, -1) {
+		var params map[string]any
+		// The decoder stops after the object, so the broken quoting behind it does not matter.
+		if json.NewDecoder(strings.NewReader(text[match[1]:])).Decode(&params) != nil {
+			return nil, false
+		}
+		raw, _ := json.Marshal(params)
+		name := text[match[2]:match[3]]
+		if key := name + "\x00" + string(raw); !seen[key] {
+			seen[key] = true
+			calls = append(calls, map[string]any{"tool_name": name, "params": string(raw)})
+		}
+	}
+	if len(calls) == 0 {
+		return nil, false
+	}
+	call, ok := normalizeToolCall(map[string]any{"name": callToolName, "arguments": map[string]any{"calls": calls}}, 0)
+	return []openAIToolCall{call}, ok
+}
+
+// encodeCallToolParams turns params objects into the JSON strings call_tool
+// expects, because models are told to send the object rather than escape it.
+func encodeCallToolParams(args any) any {
+	if text, ok := args.(string); ok {
+		var decoded map[string]any
+		if json.Unmarshal([]byte(text), &decoded) != nil {
+			return args
+		}
+		args = decoded
+	}
+	argsMap, ok := args.(map[string]any)
+	if !ok {
+		return args
+	}
+	calls, _ := argsMap["calls"].([]any)
+	for _, call := range calls {
+		item, ok := call.(map[string]any)
+		if !ok || item["params"] == nil {
+			continue
+		}
+		if _, isString := item["params"].(string); !isString {
+			raw, _ := json.Marshal(item["params"])
+			item["params"] = string(raw)
+		}
+	}
+	return argsMap
 }
 
 // DeepSeek ignores the JSON instruction and writes tool calls in its own DSML
@@ -1028,6 +1114,9 @@ func normalizeToolCall(value any, _ int) (openAIToolCall, bool) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return openAIToolCall{}, false
+	}
+	if name == callToolName {
+		args = encodeCallToolParams(args)
 	}
 	return openAIToolCall{
 		ID:   id,
