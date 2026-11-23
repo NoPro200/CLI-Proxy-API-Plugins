@@ -371,14 +371,31 @@ func formatToolResultMessage(message openAIMessage) string {
 	return fmt.Sprintf("Tool result for %s%s:\n%s", id, name, content)
 }
 
+// formatAssistantToolCalls writes earlier calls exactly in the format the model
+// is told to use, with arguments as objects. In long chats models copy the
+// history over the instructions; OpenAI's arguments strings there taught them to
+// write arguments as strings whose quotes they then forget to escape.
 func formatAssistantToolCalls(calls []openAIToolCall) string {
-	raw, _ := json.Marshal(calls)
-	return "Assistant requested these tool calls:\n" + string(raw)
+	items := make([]map[string]any, 0, len(calls))
+	for _, call := range calls {
+		var args any = map[string]any{}
+		if text := strings.TrimSpace(call.Function.Arguments); text != "" {
+			var decoded any
+			if json.Unmarshal([]byte(text), &decoded) == nil {
+				args = decoded
+			} else {
+				args = text
+			}
+		}
+		items = append(items, map[string]any{"name": call.Function.Name, "arguments": args})
+	}
+	raw, _ := json.Marshal(map[string]any{"tool_calls": items})
+	return string(raw)
 }
 
 // toolReminder repeats the call format right before the answer: in long contexts
 // GLM falls back to its native <tool_call> syntax, which Venice cuts off unseen.
-const toolReminder = `(Tool reminder: to call a tool, reply with only {"tool_calls":[{"name":"tool_name","arguments":{}}]}. Never use <tool_call> tags.)`
+const toolReminder = `(Tool reminder: to call a tool, reply with only {"tool_calls":[{"name":"tool_name","arguments":{}}]}. "arguments" is a JSON object, never a string. Put all calls in that one object. Never use <tool_call> tags.)`
 
 // toolRepairPrompt asks once more for a call that Venice cut off.
 const toolRepairPrompt = `Your tool call did not arrive. Reply with only this JSON and nothing else, with valid braces: {"tool_calls":[{"name":"<tool>","arguments":{<args>}}]}`
@@ -396,7 +413,8 @@ func toolInstructions(req openAIRequest) string {
 	return strings.TrimSpace(fmt.Sprintf(`Tool calling is available.
 When you need a tool, respond with exactly one JSON object and no markdown, no prose, and no surrounding text:
 {"tool_calls":[{"name":"tool_name","arguments":{}}]}
-The "name" must exactly match one available tool name. The "arguments" value must be a JSON object matching that tool schema.
+The "name" must exactly match one available tool name. The "arguments" value must be a JSON object matching that tool schema, written as an object and never as a string.
+To call several tools at once, list them all in that single "tool_calls" array.
 Never use <tool_call> tags or any other tool-call syntax; such calls are lost.%s
 After tool results are provided in later messages, answer normally or request another tool with the same JSON format.
 
@@ -444,7 +462,7 @@ func needsToolRepair(req openAIRequest, content string) bool {
 // parseToolCalls could not read, typically GLM's JSON with a stray brace or its
 // native <tool_call> tag. Repairing it turns the visible JSON into a real call.
 func looksLikeToolCallAttempt(text string) bool {
-	if strings.Contains(text, "<tool_call") || dsmlTag.MatchString(text) {
+	if strings.Contains(text, "<tool_call") || dsmlTag.MatchString(text) || toolCallsObject.MatchString(text) {
 		return true
 	}
 	// Only a body that is primarily the tool-call JSON, not prose that mentions a tool.
@@ -909,6 +927,9 @@ func openAIStreamPayload(id string, created int64, model string, delta map[strin
 }
 
 func parseToolCalls(text string) ([]openAIToolCall, bool) {
+	if calls, ok := parseSeveralToolCallObjects(text); ok {
+		return calls, true
+	}
 	for _, candidate := range toolJSONCandidates(text) {
 		if calls, ok := parseToolCallsJSON(candidate); ok {
 			return calls, true
@@ -917,7 +938,75 @@ func parseToolCalls(text string) ([]openAIToolCall, bool) {
 	if calls, ok := parseDSMLToolCalls(text); ok {
 		return calls, true
 	}
-	return parseBrokenCallToolCalls(text)
+	if calls, ok := parseBrokenCallToolCalls(text); ok {
+		return calls, true
+	}
+	return parseBrokenArgumentsToolCalls(text)
+}
+
+// toolCallsObject finds the start of a {"tool_calls":...} object, also behind prose.
+var toolCallsObject = regexp.MustCompile(`\{\s*"(?:tool_calls|toolCalls)"\s*:`)
+
+// parseSeveralToolCallObjects reads answers that hold more than one
+// {"tool_calls":...} object, as models write in long chats with a line of prose
+// before each call, and joins their calls. Otherwise only the first would run.
+func parseSeveralToolCallObjects(text string) ([]openAIToolCall, bool) {
+	locs := toolCallsObject.FindAllStringIndex(text, -1)
+	if len(locs) < 2 {
+		return nil, false
+	}
+	var calls []openAIToolCall
+	seen := make(map[string]bool)
+	for i, loc := range locs {
+		// Each object ends before the next one; broken quoting cannot run past it.
+		segment := text[loc[0]:]
+		if i+1 < len(locs) {
+			segment = text[loc[0]:locs[i+1][0]]
+		}
+		parsed, ok := parseToolCallsJSON(extractBalancedJSON(segment, '{', '}'))
+		if !ok {
+			parsed, ok = parseBrokenArgumentsToolCalls(segment)
+		}
+		if !ok {
+			return nil, false
+		}
+		for _, call := range parsed {
+			if key := call.Function.Name + "\x00" + call.Function.Arguments; !seen[key] {
+				seen[key] = true
+				calls = append(calls, call)
+			}
+		}
+	}
+	return calls, len(calls) > 0
+}
+
+// brokenArgumentsEntry finds the name and the start of the arguments of each call.
+var brokenArgumentsEntry = regexp.MustCompile(`"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*"?`)
+
+// parseBrokenArgumentsToolCalls rescues {"tool_calls":[...]} answers that are
+// invalid JSON because the model wrote each arguments object as a string without
+// escaping its quotes, as in "arguments":"{"query":"x"}". Identical calls count once.
+func parseBrokenArgumentsToolCalls(text string) ([]openAIToolCall, bool) {
+	if !toolCallsObject.MatchString(text) {
+		return nil, false
+	}
+	var calls []openAIToolCall
+	seen := make(map[string]bool)
+	for _, match := range brokenArgumentsEntry.FindAllStringSubmatchIndex(text, -1) {
+		args, ok := decodeLeadingObject(text[match[1]:])
+		if !ok {
+			return nil, false
+		}
+		call, ok := normalizeToolCall(map[string]any{"name": text[match[2]:match[3]], "arguments": args}, len(calls))
+		if !ok {
+			return nil, false
+		}
+		if key := call.Function.Name + "\x00" + call.Function.Arguments; !seen[key] {
+			seen[key] = true
+			calls = append(calls, call)
+		}
+	}
+	return calls, len(calls) > 0
 }
 
 // callToolName is OpenWebUI's tool for invoking deferred tools. It takes each
@@ -1113,6 +1202,12 @@ func toolJSONCandidates(text string) []string {
 	}
 	if obj := extractBalancedJSON(text, '{', '}'); obj != "" && obj != text {
 		out = append(out, obj)
+	}
+	// Prose before the call may hold braces of its own, so also start at the call.
+	if loc := toolCallsObject.FindStringIndex(text); loc != nil && loc[0] > 0 {
+		if obj := extractBalancedJSON(text[loc[0]:], '{', '}'); obj != "" {
+			out = append(out, obj)
+		}
 	}
 	if arr := extractBalancedJSON(text, '[', ']'); arr != "" && arr != text {
 		out = append(out, arr)

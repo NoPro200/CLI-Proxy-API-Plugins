@@ -351,8 +351,10 @@ func TestNeedsToolRepair(t *testing.T) {
 		{"bold lead-in", tools, "**Ich prüfe zuerst:**", true},
 		{"final answer", tools, "Fertig, die Datei ist angelegt.", false},
 		{"tool call", tools, `{"tool_calls":[{"name":"list_files","arguments":{}}]}`, false},
-		// GLM emits a tool call as JSON but drops a brace, so parsing fails; repair it instead of showing it.
-		{"broken tool-call json", tools, `{"tool_calls":[{"name":"run_command","arguments":{"command":"ls"}]}]}`, true},
+		// GLM drops a brace behind complete arguments; the call is read without a repair round.
+		{"broken tool-call json", tools, `{"tool_calls":[{"name":"run_command","arguments":{"command":"ls"}]}]}`, false},
+		// Arguments that are cut off cannot be read, so they get the repair round.
+		{"cut tool-call json", tools, `{"tool_calls":[{"name":"run_command","arguments":{"command":"ls`, true},
 		{"native tool_call tag", tools, "<tool_call>{\"name\":\"list_files\"", true},
 		{"deepseek dsml call", tools, deepseekDSMLCall, false},
 		// A cut-off DSML call cannot be parsed, so it gets the repair round.
@@ -431,6 +433,61 @@ func TestParseToolCallsRescuesBrokenCallTool(t *testing.T) {
 	listFiles := openAIRequest{Tools: []json.RawMessage{json.RawMessage(`{"type":"function","function":{"name":"list_files"}}`)}}
 	if !strings.Contains(toolInstructions(callTool), `write each "params" value as a plain JSON object`) || strings.Contains(toolInstructions(listFiles), "call_tool") {
 		t.Fatal("the params hint belongs exactly to requests offering call_tool")
+	}
+}
+
+// unescapedArguments is a tool call seen in Claude Code: prose, then arguments
+// written as strings whose quotes the model did not escape.
+const unescapedArguments = "Als Nächstes suche ich nach „Nrich“ (Firmen, Vereine).\n\n" +
+	`{"tool_calls":[{"name":"WebSearch","arguments":"{"query":"\"Nrich\" Bernsdorf Sachsen"}"},{"name":"WebSearch","arguments":"{"query":"\"Nrich\" Kamenz"}"},{"name":"WebSearch","arguments":"{"query":"\"Nrich\" Kamenz"}"}]}`
+
+func TestParseToolCallsRescuesUnescapedArguments(t *testing.T) {
+	calls, ok := parseToolCalls(unescapedArguments)
+	if !ok || len(calls) != 2 {
+		t.Fatalf("calls = %#v, ok = %v", calls, ok)
+	}
+	for i, want := range []string{`"Nrich" Bernsdorf Sachsen`, `"Nrich" Kamenz`} {
+		var args map[string]string
+		if err := json.Unmarshal([]byte(calls[i].Function.Arguments), &args); err != nil || calls[i].Function.Name != "WebSearch" || args["query"] != want {
+			t.Fatalf("call %d = %#v (%v)", i, calls[i], err)
+		}
+	}
+	// Braces in the prose must not hide a valid call behind it.
+	calls, ok = parseToolCalls("Plan: {a} [b] {c}\n\n" + `{"tool_calls":[{"name":"Read","arguments":{"file_path":"/x"}}]}`)
+	if !ok || len(calls) != 1 || calls[0].Function.Arguments != `{"file_path":"/x"}` {
+		t.Fatalf("behind braces = %#v, ok = %v", calls, ok)
+	}
+	// A call that stays unreadable behind prose is still sent back for repair.
+	req := openAIRequest{Tools: []json.RawMessage{json.RawMessage(`{"type":"function","function":{"name":"WebSearch"}}`)}}
+	if !needsToolRepair(req, "Ich suche jetzt.\n\n"+`{"tool_calls":[{"name":"WebSearch","arguments":{"query":"x`) {
+		t.Fatal("a cut call behind prose needs repair")
+	}
+	if needsToolRepair(req, `Antwort: die Option "tool_calls" steuert das.`) {
+		t.Fatal("prose that only mentions tool_calls needs no repair")
+	}
+}
+
+func TestParseToolCallsJoinsSeveralObjects(t *testing.T) {
+	text := "Erst lese ich die Datei.\n" + `{"tool_calls":[{"name":"Read","arguments":{"file_path":"/a"}}]}` +
+		"\nDann suche ich.\n" + `{"tool_calls":[{"name":"WebSearch","arguments":"{"query":"\"x\" y"}"}]}` +
+		"\nNochmal:\n" + `{"tool_calls":[{"name":"Read","arguments":{"file_path":"/a"}}]}`
+	calls, ok := parseToolCalls(text)
+	if !ok || len(calls) != 2 || calls[0].Function.Name != "Read" || calls[1].Function.Arguments != `{"query":"\"x\" y"}` {
+		t.Fatalf("calls = %#v, ok = %v", calls, ok)
+	}
+}
+
+func TestHistoryToolCallsUseTheInstructedFormat(t *testing.T) {
+	got := formatAssistantToolCalls([]openAIToolCall{
+		{ID: "call_1", Type: "function", Function: openAIFunctionCall{Name: "WebSearch", Arguments: `{"query":"\"Nrich\" Kamenz"}`}},
+		{ID: "call_2", Type: "function", Function: openAIFunctionCall{Name: "TodoRead"}},
+	})
+	want := `{"tool_calls":[{"arguments":{"query":"\"Nrich\" Kamenz"},"name":"WebSearch"},{"arguments":{},"name":"TodoRead"}]}`
+	if got != want {
+		t.Fatalf("history = %s\nwant      %s", got, want)
+	}
+	if calls, ok := parseToolCalls(got); !ok || len(calls) != 2 {
+		t.Fatalf("history is not a readable call: %#v", calls)
 	}
 }
 
