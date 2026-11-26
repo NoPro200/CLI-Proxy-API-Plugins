@@ -467,6 +467,115 @@ func TestParseToolCallsRescuesUnescapedArguments(t *testing.T) {
 	}
 }
 
+// claudeCodeTools is a request offering tools the way Claude Code names them.
+var claudeCodeTools = openAIRequest{Tools: []json.RawMessage{
+	json.RawMessage(`{"type":"function","function":{"name":"Read"}}`),
+	json.RawMessage(`{"type":"function","function":{"name":"WebSearch"}}`),
+	json.RawMessage(`{"type":"function","function":{"name":"mcp__camoufox__navigate"}}`),
+}}
+
+func TestToolCallsForMatchesOfferedNames(t *testing.T) {
+	cases := []struct{ written, want string }{
+		{"Read", "Read"},
+		{"functions.Read", "Read"},
+		{"default_api:WebSearch", "WebSearch"},
+		{"web_search", "WebSearch"},
+		{"MCP__CAMOUFOX__NAVIGATE", "mcp__camoufox__navigate"},
+		// An unknown tool in the wrapper still goes out; the client's error tells the model.
+		{"Bash", "Bash"},
+	}
+	for _, tc := range cases {
+		calls, ok := toolCallsFor(claudeCodeTools, `{"tool_calls":[{"name":"`+tc.written+`","arguments":{}}]}`)
+		if !ok || calls[0].Function.Name != tc.want {
+			t.Errorf("%s: calls = %#v, ok = %v, want %s", tc.written, calls, ok, tc.want)
+		}
+	}
+	// JSON data with a "name" field is an answer, not a call.
+	for _, data := range []string{`[{"name":"Max","alter":3},{"name":"Eva","alter":5}]`, `{"name":"Max","alter":3}`} {
+		if calls, ok := toolCallsFor(claudeCodeTools, data); ok {
+			t.Errorf("%s became calls %#v", data, calls)
+		}
+		if needsToolRepair(claudeCodeTools, data) {
+			t.Errorf("%s needs no repair", data)
+		}
+	}
+}
+
+func TestToolChoiceNoneSwitchesToolCallsOff(t *testing.T) {
+	none := claudeCodeTools
+	none.ToolChoice = "none"
+	none.Messages = []openAIMessage{{Role: "user", Content: "Fass zusammen."}}
+	if system, prompt := splitMessages(none); strings.Contains(system, "Tool calling") || strings.Contains(prompt[0]["content"], "Tool reminder") {
+		t.Fatalf("tool_choice none still asks for calls: %q / %q", system, prompt[0]["content"])
+	}
+	call := `{"tool_calls":[{"name":"Read","arguments":{"file_path":"/a"}}]}`
+	if strings.Contains(string(openAICompletion(call, "", "id", "m", none)), `"tool_calls":[{"id"`) {
+		t.Fatal("tool_choice none turned the answer into a tool call")
+	}
+	// With tool results in the history, a call there gets the final-answer round.
+	none.Messages = append(none.Messages, openAIMessage{Role: "tool", ToolCallID: "c1", Content: "x"})
+	if !needsFinalAnswer(none, call) {
+		t.Fatal("a call after tool results with tool_choice none needs a plain answer")
+	}
+}
+
+func TestToolCallKeepsProseAndForgivesTrailingCommas(t *testing.T) {
+	cases := []struct{ content, prose string }{
+		{"Ich lese die Datei [1].\n\n" + `{"tool_calls":[{"name":"Read","arguments":{"file_path":"/a",},},]}`, "Ich lese die Datei [1]."},
+		{"Ich lese die Datei.\n```json\n" + `{"tool_calls":[{"name":"Read","arguments":{"file_path":"/a"}}]}` + "\n```", "Ich lese die Datei."},
+		{"Erst lesen:\n" + `[{"name":"Read","arguments":{"file_path":"/a"}}]`, "Erst lesen:"},
+		{`{"tool_calls":[{"name":"Read","arguments":{"file_path":"/a"}}]}`, ""},
+	}
+	for _, tc := range cases {
+		var out struct {
+			Choices []struct {
+				Message struct {
+					Content   *string          `json:"content"`
+					ToolCalls []openAIToolCall `json:"tool_calls"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(openAICompletion(tc.content, "", "id", "m", claudeCodeTools), &out); err != nil {
+			t.Fatal(err)
+		}
+		message := out.Choices[0].Message
+		if len(message.ToolCalls) != 1 || message.ToolCalls[0].Function.Arguments != `{"file_path":"/a"}` {
+			t.Errorf("%q: tool calls = %#v", tc.content, message.ToolCalls)
+		}
+		got := ""
+		if message.Content != nil {
+			got = *message.Content
+		}
+		if got != tc.prose || (tc.prose == "" && message.Content != nil) {
+			t.Errorf("%q: content = %q, want %q", tc.content, got, tc.prose)
+		}
+	}
+}
+
+func TestStreamSendsReasoningLiveAndProseWithToolCall(t *testing.T) {
+	in := make(chan pluginapi.HTTPStreamChunk, 3)
+	in <- pluginapi.HTTPStreamChunk{Payload: []byte(`{"kind":"content","reasoning_content":"Ich brauche die Datei."}` + "\n")}
+	in <- pluginapi.HTTPStreamChunk{Payload: []byte(`{"kind":"content","content":"Ich lese sie.\n\n{\"tool_calls\":[{\"name\":\"functions.Read\","}` + "\n")}
+	in <- pluginapi.HTTPStreamChunk{Payload: []byte(`{"kind":"content","content":"\"arguments\":{\"file_path\":\"/a\"}}]}"}` + "\n")}
+	close(in)
+	var frames []string
+	for chunk := range openAIStreamChunks(context.Background(), in, "m", claudeCodeTools) {
+		frames = append(frames, string(chunk.Payload))
+	}
+	joined := strings.Join(frames, "\n")
+	if len(frames) < 2 || !strings.Contains(frames[1], `"reasoning_content":"Ich brauche die Datei."`) {
+		t.Fatalf("reasoning did not stream first: %s", joined)
+	}
+	if strings.Count(joined, "Ich brauche die Datei.") != 1 {
+		t.Fatalf("reasoning sent twice: %s", joined)
+	}
+	prose := strings.Index(joined, `"content":"Ich lese sie."`)
+	call := strings.Index(joined, `"name":"Read"`)
+	if prose < 0 || call < 0 || prose > call || !strings.Contains(joined, `"finish_reason":"tool_calls"`) || strings.Contains(joined, `\"tool_calls\"`) {
+		t.Fatalf("stream = %s, want the prose, then the Read call", joined)
+	}
+}
+
 func TestParseToolCallsJoinsSeveralObjects(t *testing.T) {
 	text := "Erst lese ich die Datei.\n" + `{"tool_calls":[{"name":"Read","arguments":{"file_path":"/a"}}]}` +
 		"\nDann suche ich.\n" + `{"tool_calls":[{"name":"WebSearch","arguments":"{"query":"\"x\" y"}"}]}` +

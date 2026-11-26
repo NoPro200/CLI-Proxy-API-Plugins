@@ -290,7 +290,7 @@ func splitMessages(req openAIRequest) (string, []map[string]string) {
 		}
 		prompt = append(prompt, map[string]string{"role": role, "content": content})
 	}
-	if len(req.Tools) > 0 && len(prompt) > 0 && prompt[len(prompt)-1]["role"] == "user" {
+	if toolsEnabled(req) && len(prompt) > 0 && prompt[len(prompt)-1]["role"] == "user" {
 		prompt[len(prompt)-1]["content"] += "\n\n" + toolReminder
 	}
 	if instructions := toolInstructions(req); instructions != "" {
@@ -400,8 +400,15 @@ const toolReminder = `(Tool reminder: to call a tool, reply with only {"tool_cal
 // toolRepairPrompt asks once more for a call that Venice cut off.
 const toolRepairPrompt = `Your tool call did not arrive. Reply with only this JSON and nothing else, with valid braces: {"tool_calls":[{"name":"<tool>","arguments":{<args>}}]}`
 
+// toolsEnabled reports whether the model may call tools in this reply. With
+// tool_choice "none" the tools are only listed, and a call would be lost.
+func toolsEnabled(req openAIRequest) bool {
+	choice, _ := req.ToolChoice.(string)
+	return len(req.Tools) > 0 && choice != "none"
+}
+
 func toolInstructions(req openAIRequest) string {
-	if len(req.Tools) == 0 {
+	if !toolsEnabled(req) {
 		return ""
 	}
 	toolsRaw, _ := json.Marshal(req.Tools)
@@ -448,10 +455,10 @@ func aggregateOpenAIResponse(body []byte, model string, req openAIRequest) []byt
 // needsToolRepair spots tool-enabled answers that Venice cut off at a native
 // <tool_call>: nothing at all, or only a lead-in ending in a colon.
 func needsToolRepair(req openAIRequest, content string) bool {
-	if len(req.Tools) == 0 || req.ToolChoice == "none" {
+	if !toolsEnabled(req) {
 		return false
 	}
-	if _, ok := parseToolCalls(content); ok {
+	if _, ok := toolCallsFor(req, content); ok {
 		return false
 	}
 	text := strings.TrimRight(strings.TrimSpace(content), "*_ ")
@@ -475,10 +482,10 @@ func looksLikeToolCallAttempt(text string) bool {
 
 const finalAnswerPrompt = `Tool calls are switched off for this reply and would be lost. Answer the user now in plain text with the tool results you already have, and say briefly what is still open.`
 
-// finalAnswerTurn spots OpenWebUI's last request of a tool loop: after tool
-// results it switches tools off and asks for an answer.
+// finalAnswerTurn spots the last request of a tool loop: after tool results the
+// client switches tools off with tool_choice "none" and asks for an answer.
 func finalAnswerTurn(req openAIRequest) bool {
-	if len(req.Tools) > 0 || req.ToolChoice != "none" {
+	if choice, _ := req.ToolChoice.(string); toolsEnabled(req) || choice != "none" {
 		return false
 	}
 	for _, message := range req.Messages {
@@ -508,7 +515,7 @@ func repairAnswer(ctx context.Context, req openAIRequest, content string, ask fu
 	switch {
 	case needsToolRepair(req, content):
 		if again, ok := ask(ctx, content, toolRepairPrompt); ok {
-			if _, parsed := parseToolCalls(again); parsed {
+			if _, parsed := toolCallsFor(req, again); parsed {
 				return again
 			}
 		}
@@ -579,8 +586,11 @@ func collectVeniceText(body []byte) (string, string, string) {
 func openAICompletion(content, reasoning, upstreamID, model string, req openAIRequest) []byte {
 	message := map[string]any{"role": "assistant", "content": content}
 	finishReason := "stop"
-	if toolCalls, ok := parseToolCalls(content); ok && len(req.Tools) > 0 {
+	if toolCalls, ok := toolCallsFor(req, content); ok {
 		message["content"] = nil
+		if prose := proseBeforeToolCall(content); prose != "" {
+			message["content"] = prose
+		}
 		message["tool_calls"] = toolCalls
 		finishReason = "tool_calls"
 	}
@@ -619,7 +629,7 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 		created := time.Now().Unix()
 		content := strings.Builder{}
 		reasoning := strings.Builder{}
-		buffered := len(req.Tools) > 0 || finalAnswerTurn(req)
+		buffered := toolsEnabled(req) || finalAnswerTurn(req)
 		emit := func(payload map[string]any) bool {
 			raw, _ := json.Marshal(payload)
 			select {
@@ -648,7 +658,8 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 					}
 					promptTokens := estimateRequestTokens(req)
 					completionTokens := estimateTokens(final) + estimateTokens(reasoning.String())
-					if buffered && !emitBufferedToolAwareStream(emit, streamID, created, model, req, final, reasoning.String()) {
+					// Reasoning went out live, so only the content follows here.
+					if buffered && !emitBufferedToolAwareStream(emit, streamID, created, model, req, final, "") {
 						return
 					}
 					if !buffered && !emit(openAIStreamPayload(streamID, created, model, map[string]any{}, "stop")) {
@@ -688,12 +699,20 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 						continue
 					}
 					if buffered {
+						// Only the content can hold a tool call and waits for the end.
+						// Reasoning streams live: the client shows thinking, and the
+						// connection does not sit silent through a long answer.
 						if event.Content != "" || event.ReasoningContent != "" {
 							if span != nil {
 								span.MarkTTFT()
 							}
 							content.WriteString(event.Content)
+						}
+						if event.ReasoningContent != "" {
 							reasoning.WriteString(event.ReasoningContent)
+							if !emit(openAIStreamPayload(streamID, created, model, map[string]any{"reasoning_content": event.ReasoningContent}, nil)) {
+								return
+							}
 						}
 						continue
 					}
@@ -726,7 +745,17 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 }
 
 func emitBufferedToolAwareStream(emit func(map[string]any) bool, streamID string, created int64, model string, req openAIRequest, content, reasoning string) bool {
-	if toolCalls, ok := parseToolCalls(content); ok && len(req.Tools) > 0 {
+	if toolCalls, ok := toolCallsFor(req, content); ok {
+		lead := make(map[string]any)
+		if prose := proseBeforeToolCall(content); prose != "" {
+			lead["content"] = prose
+		}
+		if reasoning != "" {
+			lead["reasoning_content"] = reasoning
+		}
+		if len(lead) > 0 && !emit(openAIStreamPayload(streamID, created, model, lead, nil)) {
+			return false
+		}
 		for i, call := range toolCalls {
 			delta := map[string]any{
 				"tool_calls": []map[string]any{{
@@ -926,6 +955,131 @@ func openAIStreamPayload(id string, created int64, model string, delta map[strin
 	}
 }
 
+// toolCallsFor reads the tool calls of an answer to a request that allows them
+// and gives each the exact name of the offered tool it means: models write
+// "functions.Read", "web_search" for WebSearch, or other case and separators.
+// An answer whose names match no offered tool is only a call when it uses the
+// {"tool_calls":...} wrapper; otherwise it is data, such as a JSON list of
+// records with a "name" field, and stays the answer.
+func toolCallsFor(req openAIRequest, content string) ([]openAIToolCall, bool) {
+	if !toolsEnabled(req) {
+		return nil, false
+	}
+	calls, ok := parseToolCalls(content)
+	if !ok {
+		return nil, false
+	}
+	offered := offeredToolNames(req)
+	if len(offered) == 0 {
+		return calls, true
+	}
+	known := 0
+	for i := range calls {
+		if name, found := canonicalToolName(calls[i].Function.Name, offered); found {
+			calls[i].Function.Name = name
+			known++
+		}
+	}
+	if known == 0 && !explicitCallSyntax(content) {
+		return nil, false
+	}
+	return calls, true
+}
+
+// explicitCallSyntax reports a tool-call wrapper that only a call uses. An
+// unknown tool in it still goes to the client, whose error tells the model.
+func explicitCallSyntax(content string) bool {
+	return toolCallsObject.MatchString(content) || dsmlTag.MatchString(content)
+}
+
+func offeredToolNames(req openAIRequest) []string {
+	names := make([]string, 0, len(req.Tools))
+	for _, raw := range req.Tools {
+		var tool struct {
+			Name     string `json:"name"`
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		}
+		if json.Unmarshal(raw, &tool) != nil {
+			continue
+		}
+		if name := firstNonEmpty(tool.Function.Name, tool.Name); name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// canonicalToolName finds the offered tool a written name means: the exact
+// name first, then the same letters and digits in any case, also behind a
+// namespace such as "functions." or "default_api:".
+func canonicalToolName(name string, offered []string) (string, bool) {
+	for _, candidate := range offered {
+		if candidate == name {
+			return candidate, true
+		}
+	}
+	forms := []string{name}
+	if i := strings.LastIndexAny(name, ".:/"); i >= 0 && i+1 < len(name) {
+		forms = append(forms, name[i+1:])
+	}
+	for _, form := range forms {
+		key := toolNameKey(form)
+		for _, candidate := range offered {
+			if key != "" && toolNameKey(candidate) == key {
+				return candidate, true
+			}
+		}
+	}
+	return name, false
+}
+
+func toolNameKey(name string) string {
+	var out strings.Builder
+	for _, r := range strings.ToLower(name) {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			out.WriteRune(r)
+		}
+	}
+	return out.String()
+}
+
+// proseBeforeToolCall returns the text a model wrote before its tool call, so
+// the client shows it next to the call instead of dropping it.
+func proseBeforeToolCall(content string) string {
+	end := -1
+	consider := func(i int) {
+		if i >= 0 && (end < 0 || i < end) {
+			end = i
+		}
+	}
+	for _, pattern := range []*regexp.Regexp{toolCallsObject, dsmlTag} {
+		if loc := pattern.FindStringIndex(content); loc != nil {
+			consider(loc[0])
+		}
+	}
+	consider(strings.Index(content, "<tool_call"))
+	if end < 0 {
+		// A call without the wrapper: in a code fence, a bare object or a list.
+		consider(strings.Index(content, "```"))
+		consider(strings.IndexByte(content, '{'))
+		if loc := bareCallList.FindStringIndex(content); loc != nil {
+			consider(loc[0])
+		}
+	}
+	if end <= 0 {
+		return ""
+	}
+	// A call inside a code fence leaves the fence opener behind.
+	return strings.TrimSpace(fenceOpener.ReplaceAllString(content[:end], ""))
+}
+
+var (
+	bareCallList = regexp.MustCompile(`\[\s*\{`)
+	fenceOpener  = regexp.MustCompile("```[A-Za-z]*\\s*$")
+)
+
 func parseToolCalls(text string) ([]openAIToolCall, bool) {
 	if calls, ok := parseSeveralToolCallObjects(text); ok {
 		return calls, true
@@ -980,6 +1134,8 @@ func parseSeveralToolCallObjects(text string) ([]openAIToolCall, bool) {
 	return calls, len(calls) > 0
 }
 
+const maxRescuedCalls = 64
+
 // brokenArgumentsEntry finds the name and the start of the arguments of each call.
 var brokenArgumentsEntry = regexp.MustCompile(`"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*"?`)
 
@@ -992,7 +1148,12 @@ func parseBrokenArgumentsToolCalls(text string) ([]openAIToolCall, bool) {
 	}
 	var calls []openAIToolCall
 	seen := make(map[string]bool)
-	for _, match := range brokenArgumentsEntry.FindAllStringSubmatchIndex(text, -1) {
+	// Each entry rescans the rest of the text, so a flood of them is not a call.
+	matches := brokenArgumentsEntry.FindAllStringSubmatchIndex(text, maxRescuedCalls+1)
+	if len(matches) > maxRescuedCalls {
+		return nil, false
+	}
+	for _, match := range matches {
 		args, ok := decodeLeadingObject(text[match[1]:])
 		if !ok {
 			return nil, false
@@ -1048,7 +1209,8 @@ func parseBrokenCallToolCalls(text string) ([]openAIToolCall, bool) {
 // follows it. The decoder stops after the object, so broken quoting behind it
 // does not matter; JSON the model broke inside the object gets mended once.
 func decodeLeadingObject(text string) (map[string]any, bool) {
-	for _, candidate := range []string{text, repairNestedJSON(text)} {
+	repaired := repairNestedJSON(text)
+	for _, candidate := range []string{text, dropTrailingCommas(text), repaired, dropTrailingCommas(repaired)} {
 		var object map[string]any
 		if json.NewDecoder(strings.NewReader(candidate)).Decode(&object) == nil {
 			return object, true
@@ -1148,6 +1310,36 @@ func repairNestedJSON(text string) string {
 		default:
 			out.WriteByte(c)
 		}
+	}
+	return out.String()
+}
+
+// dropTrailingCommas removes commas right before } or ], which models write
+// out of habit and JSON forbids. Commas inside strings stay.
+func dropTrailingCommas(text string) string {
+	var out strings.Builder
+	inString, escaped := false, false
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if inString {
+			out.WriteByte(c)
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+		if c == ',' {
+			if rest := strings.TrimLeft(text[i+1:], " \t\r\n"); rest != "" && (rest[0] == '}' || rest[0] == ']') {
+				continue
+			}
+		}
+		inString = c == '"'
+		out.WriteByte(c)
 	}
 	return out.String()
 }
@@ -1270,8 +1462,11 @@ func extractBalancedJSON(text string, open, close rune) string {
 
 func parseToolCallsJSON(raw string) ([]openAIToolCall, bool) {
 	var value any
-	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &value); err != nil {
-		return nil, false
+	raw = strings.TrimSpace(raw)
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		if json.Unmarshal([]byte(dropTrailingCommas(raw)), &value) != nil {
+			return nil, false
+		}
 	}
 	items := toolCallItems(value)
 	if len(items) == 0 {
