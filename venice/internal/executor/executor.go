@@ -257,7 +257,9 @@ func buildVeniceBody(openReq openAIRequest, veniceModel string) ([]byte, error) 
 		"systemPrompt":                 systemPrompt,
 		"temperature":                  temperature,
 		"topP":                         topP,
-		"webEnabled":                   true,
+		// Clients with tools search themselves; Venice's own search would fill the
+		// context with results and put citation marks into the tool calls.
+		"webEnabled":                   !toolsEnabled(openReq),
 		"webScrapeEnabled":             false,
 		"xSearchEnabled":               false,
 	}
@@ -291,7 +293,7 @@ func splitMessages(req openAIRequest) (string, []map[string]string) {
 		prompt = append(prompt, map[string]string{"role": role, "content": content})
 	}
 	if toolsEnabled(req) && len(prompt) > 0 && prompt[len(prompt)-1]["role"] == "user" {
-		prompt[len(prompt)-1]["content"] += "\n\n" + toolReminder
+		prompt[len(prompt)-1]["content"] += "\n\n" + toolReminderFor(req)
 	}
 	if instructions := toolInstructions(req); instructions != "" {
 		systemParts = append(systemParts, instructions)
@@ -396,6 +398,16 @@ func formatAssistantToolCalls(calls []openAIToolCall) string {
 // toolReminder repeats the call format right before the answer: in long contexts
 // GLM falls back to its native <tool_call> syntax, which Venice cuts off unseen.
 const toolReminder = `(Tool reminder: to call a tool, reply with only {"tool_calls":[{"name":"tool_name","arguments":{}}]}. "arguments" is a JSON object, never a string. Put all calls in that one object. Never use <tool_call> tags.)`
+
+// toolReminderFor adds the offered tool names to the reminder. In long chats the
+// tool list in the system prompt lies far back, and models then guess names.
+func toolReminderFor(req openAIRequest) string {
+	names := offeredToolNames(req)
+	if len(names) == 0 {
+		return toolReminder
+	}
+	return strings.TrimSuffix(toolReminder, ")") + " Tool names: " + strings.Join(names, ", ") + ".)"
+}
 
 // toolRepairPrompt asks once more for a call that Venice cut off.
 const toolRepairPrompt = `Your tool call did not arrive. Reply with only this JSON and nothing else, with valid braces: {"tool_calls":[{"name":"<tool>","arguments":{<args>}}]}`

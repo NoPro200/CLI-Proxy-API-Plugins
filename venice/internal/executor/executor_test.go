@@ -124,8 +124,15 @@ func TestBuildVeniceRequestAddsToolInstructions(t *testing.T) {
 	if strings.HasPrefix(last["content"].(string), "/think ") {
 		t.Fatalf("tool-enabled request should not force /think: %#v", last["content"])
 	}
-	if !strings.HasSuffix(last["content"].(string), toolReminder) {
-		t.Fatalf("last message should end with the tool reminder: %#v", last["content"])
+	if !strings.HasSuffix(last["content"].(string), `Never use <tool_call> tags. Tool names: list_files.)`) {
+		t.Fatalf("last message should end with the tool reminder and the tool names: %#v", last["content"])
+	}
+	if body["webEnabled"] != false {
+		t.Fatalf("Venice web search must stay off when the client brings tools: %v", body["webEnabled"])
+	}
+	plain, _ := buildVeniceBody(openAIRequest{Messages: []openAIMessage{{Role: "user", Content: "Hallo"}}}, "m")
+	if !strings.Contains(string(plain), `"webEnabled":true`) {
+		t.Fatalf("a chat without tools keeps Venice web search: %s", plain)
 	}
 	if !strings.Contains(systemPrompt, "Never use <tool_call> tags") {
 		t.Fatalf("systemPrompt should forbid native tool tags: %s", systemPrompt)
