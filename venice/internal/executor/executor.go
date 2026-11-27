@@ -58,10 +58,41 @@ type openAIFunctionCall struct {
 }
 
 type veniceLine struct {
-	Kind             string `json:"kind"`
-	Content          string `json:"content"`
-	ReasoningContent string `json:"reasoning_content"`
-	CompletionID     string `json:"completion_id"`
+	Kind             string          `json:"kind"`
+	Content          string          `json:"content"`
+	ReasoningContent string          `json:"reasoning_content"`
+	CompletionID     string          `json:"completion_id"`
+	Error            json.RawMessage `json:"error"`
+	Message          string          `json:"message"`
+}
+
+// upstreamError returns the message of an error event, which carries no
+// assistant text and would otherwise vanish.
+func (line veniceLine) upstreamError() string {
+	isError := strings.Contains(strings.ToLower(line.Kind), "error")
+	if !isError && (len(line.Error) == 0 || string(line.Error) == "null" || string(line.Error) == "false") {
+		return ""
+	}
+	raw, _ := json.Marshal(line)
+	if message := upstreamErrorMessage(raw); message != "" && !strings.HasPrefix(message, "{") {
+		return message
+	}
+	return firstNonEmpty(line.Message, line.Content, "error event without a message")
+}
+
+// emptyAnswerError replaces a reply without content or tool call. Sent as a
+// success it would end the client's turn silently; as an error the client
+// reports it and can retry.
+func emptyAnswerError(reason error, upstream string) error {
+	message := errEmptyAnswer.Error()
+	if reason != nil {
+		message = reason.Error()
+	}
+	if upstream != "" {
+		message += ": " + upstream
+	}
+	raw, _ := json.Marshal(map[string]any{"error": map[string]string{"message": message}})
+	return statusError{statusCode: http.StatusBadGateway, body: raw}
 }
 
 func NewExecutor() *Executor { return &Executor{} }
@@ -104,10 +135,15 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 		span.Finish(monitor.Result{Success: false, Error: errStatus.Error()})
 		return pluginapi.ExecutorResponse{}, errStatus
 	}
-	content, reasoning, upstreamID := collectVeniceText(resp.Body)
-	content = repairAnswer(ctx, openReq, content, func(ctx context.Context, partial, prompt string) (string, bool) {
+	content, reasoning, upstreamID, upstreamErr := collectVeniceText(resp.Body)
+	content, errAnswer := repairAnswer(ctx, openReq, content, reasoning, func(ctx context.Context, partial, prompt string) (string, bool) {
 		return askAgain(ctx, req.HTTPClient, *storage, model, openReq, partial, prompt)
 	})
+	if errAnswer != nil {
+		errAnswer = emptyAnswerError(errAnswer, upstreamErr)
+		span.Finish(monitor.Result{Success: false, Error: errAnswer.Error()})
+		return pluginapi.ExecutorResponse{}, errAnswer
+	}
 	payload := openAICompletion(content, reasoning, upstreamID, model, openReq)
 	usage := usageFromOpenAIResponse(payload)
 	span.Finish(monitor.Result{Success: true, OutputTokens: usage.OutputTokens, TotalTokens: usage.TotalTokens})
@@ -460,7 +496,7 @@ func offersTool(req openAIRequest, name string) bool {
 }
 
 func aggregateOpenAIResponse(body []byte, model string, req openAIRequest) []byte {
-	content, reasoning, upstreamID := collectVeniceText(body)
+	content, reasoning, upstreamID, _ := collectVeniceText(body)
 	return openAICompletion(content, reasoning, upstreamID, model, req)
 }
 
@@ -523,20 +559,108 @@ func needsFinalAnswer(req openAIRequest, content string) bool {
 // repairAnswer gives an unusable answer one more round with Venice: a tool call
 // it cut off is asked for again, and a tool call in a final-answer turn is
 // replaced by a plain answer. Without a better answer the original stays.
-func repairAnswer(ctx context.Context, req openAIRequest, content string, ask func(context.Context, string, string) (string, bool)) string {
+// A tool call it finds only in the reasoning counts as the answer's call. An
+// answer that stays empty where a reply is due is an error, never a silent end.
+func repairAnswer(ctx context.Context, req openAIRequest, content, reasoning string, ask func(context.Context, string, string) (string, bool)) (string, error) {
+	content = withReasoningCall(req, content, reasoning)
 	switch {
+	case ask == nil:
 	case needsToolRepair(req, content):
-		if again, ok := ask(ctx, content, toolRepairPrompt); ok {
-			if _, parsed := toolCallsFor(req, again); parsed {
-				return again
+		// The second round names the announced step; in long chats a model
+		// often needs that nudge before it writes the call.
+		for _, prompt := range []string{toolRepairPrompt, toolRepairFollowUpPrompt} {
+			if again, ok := ask(ctx, content, prompt); ok {
+				if _, parsed := toolCallsFor(req, again); parsed {
+					return again, nil
+				}
 			}
 		}
 	case needsFinalAnswer(req, content):
 		if again, ok := ask(ctx, content, finalAnswerPrompt); ok && strings.TrimSpace(again) != "" && !needsFinalAnswer(req, again) {
-			return again
+			return again, nil
 		}
 	}
-	return content
+	if strings.TrimSpace(content) == "" && (toolsEnabled(req) || finalAnswerTurn(req)) {
+		return "", errEmptyAnswer
+	}
+	// A lead-in or an unreadable call still left after the repair rounds is no
+	// answer: sent as one, it ends the client's turn right after "...:".
+	if ask != nil && needsToolRepair(req, content) {
+		return "", errCutToolCall
+	}
+	return content, nil
+}
+
+// toolRepairFollowUpPrompt is the second repair round for a lost call.
+const toolRepairFollowUpPrompt = `Your last reply announced a step but contained no tool call, so nothing happened. Do that step now: reply with only {"tool_calls":[{"name":"<tool>","arguments":{<args>}}]}, no text before or after it.`
+
+var (
+	errEmptyAnswer = fmt.Errorf("venice returned an empty answer")
+	errCutToolCall = fmt.Errorf("venice cut off the tool call the answer announced")
+)
+
+// withReasoningCall rescues a tool call that a thinking model wrote into its
+// reasoning, leaving the content empty or at a lead-in. GLM and DeepSeek do
+// this in long chats; without the rescue the client's turn just ends.
+func withReasoningCall(req openAIRequest, content, reasoning string) string {
+	if !toolsEnabled(req) || strings.TrimSpace(reasoning) == "" || !needsToolRepair(req, content) {
+		return content
+	}
+	calls, ok := callsInReasoning(req, reasoning)
+	if !ok {
+		return content
+	}
+	lead := content
+	if looksLikeToolCallAttempt(strings.TrimSpace(content)) {
+		lead = proseBeforeToolCall(content)
+	}
+	return strings.TrimSpace(lead + "\n\n" + formatAssistantToolCalls(calls))
+}
+
+// callsInReasoning reads the last tool call in a reasoning text. Reasoning
+// drafts and rejects calls before the final one, so only the last call or the
+// last run of adjacent calls counts, and only calls to offered tools.
+func callsInReasoning(req openAIRequest, reasoning string) ([]openAIToolCall, bool) {
+	var tails []string
+	if locs := toolCallsObject.FindAllStringIndex(reasoning, -1); len(locs) > 0 {
+		tail := reasoning[locs[len(locs)-1][0]:]
+		tails = append(tails, extractBalancedJSON(tail, '{', '}'), tail)
+	}
+	for _, block := range []*regexp.Regexp{glmToolCall, dsmlInvoke} {
+		if run := lastRun(reasoning, block); run != "" {
+			tails = append(tails, run)
+		}
+	}
+	offered := offeredToolNames(req)
+	for _, tail := range tails {
+		calls, ok := toolCallsFor(req, tail)
+		if !ok {
+			continue
+		}
+		known := true
+		for _, call := range calls {
+			if _, found := canonicalToolName(call.Function.Name, offered); !found && len(offered) > 0 {
+				known = false
+			}
+		}
+		if known {
+			return calls, true
+		}
+	}
+	return nil, false
+}
+
+// lastRun returns the last group of blocks that only whitespace separates.
+func lastRun(text string, block *regexp.Regexp) string {
+	locs := block.FindAllStringIndex(text, -1)
+	if len(locs) == 0 {
+		return ""
+	}
+	start, end := locs[len(locs)-1][0], locs[len(locs)-1][1]
+	for i := len(locs) - 2; i >= 0 && strings.TrimSpace(text[locs[i][1]:start]) == ""; i-- {
+		start = locs[i][0]
+	}
+	return text[start:end]
 }
 
 // askAgain sends the conversation once more with the unusable answer and a
@@ -548,6 +672,9 @@ func askAgain(ctx context.Context, client pluginapi.HostHTTPClient, storage auth
 		retry.Messages = append(retry.Messages, openAIMessage{Role: "assistant", Content: partial})
 	}
 	retry.Messages = append(retry.Messages, openAIMessage{Role: "user", Content: prompt})
+	// A thinking model puts the call back into its reasoning, so the repair
+	// round asks without reasoning where the model allows that.
+	retry.ReasoningEffort = "none"
 	body, errBody := buildVeniceBody(retry, model)
 	if errBody != nil {
 		return "", false
@@ -561,16 +688,21 @@ func askAgain(ctx context.Context, client pluginapi.HostHTTPClient, storage auth
 	if errDo != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", false
 	}
-	content, _, _ := collectVeniceText(resp.Body)
-	return content, true
+	content, reasoning, _, _ := collectVeniceText(resp.Body)
+	return withReasoningCall(req, content, reasoning), true
 }
 
-// collectVeniceText joins the assistant text of a buffered Venice response.
-func collectVeniceText(body []byte) (string, string, string) {
+// collectVeniceText joins the assistant text of a buffered Venice response and
+// returns the message of the last error event in it.
+func collectVeniceText(body []byte) (string, string, string, string) {
 	content := strings.Builder{}
 	reasoning := strings.Builder{}
 	upstreamID := "chatcmpl-" + randomID()
+	upstreamErr := ""
 	scanner := bufio.NewScanner(bytes.NewReader(body))
+	// Long answers arrive as long lines; the default 64 KB limit would end the
+	// scan there and silently cut the answer.
+	scanner.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -583,6 +715,10 @@ func collectVeniceText(body []byte) (string, string, string) {
 		if event.CompletionID != "" {
 			upstreamID = event.CompletionID
 		}
+		if message := event.upstreamError(); message != "" {
+			upstreamErr = message
+			continue
+		}
 		if !event.hasAssistantText() {
 			continue
 		}
@@ -592,7 +728,7 @@ func collectVeniceText(body []byte) (string, string, string) {
 		content.WriteString(event.Content)
 		reasoning.WriteString(event.ReasoningContent)
 	}
-	return content.String(), reasoning.String(), upstreamID
+	return content.String(), reasoning.String(), upstreamID, upstreamErr
 }
 
 func openAICompletion(content, reasoning, upstreamID, model string, req openAIRequest) []byte {
@@ -654,6 +790,57 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 		if !emit(openAIStreamPayload(streamID, created, model, map[string]any{"role": "assistant"}, nil)) {
 			return
 		}
+		upstreamErr := ""
+		fail := func(err error) {
+			if span != nil {
+				span.Finish(monitor.Result{Success: false, Error: err.Error()})
+			}
+			// An error ends the stream; no stop or usage chunk follows it.
+			select {
+			case out <- pluginapi.ExecutorStreamChunk{Err: err}:
+			case <-ctx.Done():
+			}
+		}
+		// handleLine processes one Venice event line and reports whether the
+		// stream can go on.
+		handleLine := func(line string) bool {
+			event, ok := parseVeniceLine(line)
+			if !ok {
+				return true
+			}
+			if event.CompletionID != "" {
+				streamID = event.CompletionID
+			}
+			if message := event.upstreamError(); message != "" {
+				upstreamErr = message
+				return true
+			}
+			if !event.hasAssistantText() {
+				return true
+			}
+			if event.isInitialProcessingStatus(content.Len() == 0 && reasoning.Len() == 0) {
+				return true
+			}
+			if span != nil {
+				span.MarkTTFT()
+			}
+			content.WriteString(event.Content)
+			reasoning.WriteString(event.ReasoningContent)
+			delta := make(map[string]any)
+			// With a possible tool call only the content waits for the end.
+			// Reasoning streams live: the client shows thinking, and the
+			// connection does not sit silent through a long answer.
+			if event.Content != "" && !buffered {
+				delta["content"] = event.Content
+			}
+			if event.ReasoningContent != "" {
+				delta["reasoning_content"] = event.ReasoningContent
+			}
+			return len(delta) == 0 || emit(openAIStreamPayload(streamID, created, model, delta, nil))
+		}
+		// The host passes raw network reads, which split lines anywhere. The
+		// unfinished last line waits for the next read instead of being lost.
+		pending := ""
 		for {
 			select {
 			case <-ctx.Done():
@@ -664,9 +851,17 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 				return
 			case chunk, ok := <-in:
 				if !ok {
+					if pending != "" && !handleLine(pending) {
+						return
+					}
 					final := content.String()
-					if ask != nil && buffered {
-						final = repairAnswer(ctx, req, final, ask)
+					if buffered {
+						repaired, errAnswer := repairAnswer(ctx, req, final, reasoning.String(), ask)
+						if errAnswer != nil {
+							fail(emptyAnswerError(errAnswer, upstreamErr))
+							return
+						}
+						final = repaired
 					}
 					promptTokens := estimateRequestTokens(req)
 					completionTokens := estimateTokens(final) + estimateTokens(reasoning.String())
@@ -686,67 +881,18 @@ func openAIStreamChunksWithMonitor(ctx context.Context, in <-chan pluginapi.HTTP
 					return
 				}
 				if chunk.Err != nil {
-					if span != nil {
-						span.Finish(monitor.Result{Success: false, Error: chunk.Err.Error()})
-					}
-					// An upstream error ends the stream; no stop or usage chunk follows it.
-					select {
-					case out <- pluginapi.ExecutorStreamChunk{Err: chunk.Err}:
-					case <-ctx.Done():
-					}
+					fail(chunk.Err)
 					return
 				}
-				for _, line := range strings.Split(string(chunk.Payload), "\n") {
-					event, ok := parseVeniceLine(line)
-					if !ok {
-						continue
-					}
-					if event.CompletionID != "" {
-						streamID = event.CompletionID
-					}
-					if !event.hasAssistantText() {
-						continue
-					}
-					if event.isInitialProcessingStatus(content.Len() == 0 && reasoning.Len() == 0) {
-						continue
-					}
-					if buffered {
-						// Only the content can hold a tool call and waits for the end.
-						// Reasoning streams live: the client shows thinking, and the
-						// connection does not sit silent through a long answer.
-						if event.Content != "" || event.ReasoningContent != "" {
-							if span != nil {
-								span.MarkTTFT()
-							}
-							content.WriteString(event.Content)
-						}
-						if event.ReasoningContent != "" {
-							reasoning.WriteString(event.ReasoningContent)
-							if !emit(openAIStreamPayload(streamID, created, model, map[string]any{"reasoning_content": event.ReasoningContent}, nil)) {
-								return
-							}
-						}
-						continue
-					}
-					delta := make(map[string]any)
-					if event.Content != "" {
-						if span != nil {
-							span.MarkTTFT()
-						}
-						delta["content"] = event.Content
-						content.WriteString(event.Content)
-					}
-					if event.ReasoningContent != "" {
-						if span != nil {
-							span.MarkTTFT()
-						}
-						delta["reasoning_content"] = event.ReasoningContent
-						reasoning.WriteString(event.ReasoningContent)
-					}
-					if len(delta) == 0 {
-						continue
-					}
-					if !emit(openAIStreamPayload(streamID, created, model, delta, nil)) {
+				pending += string(chunk.Payload)
+				cut := strings.LastIndexByte(pending, '\n')
+				if cut < 0 {
+					continue
+				}
+				lines := pending[:cut]
+				pending = pending[cut+1:]
+				for _, line := range strings.Split(lines, "\n") {
+					if !handleLine(line) {
 						return
 					}
 				}
@@ -1104,6 +1250,9 @@ func parseToolCalls(text string) ([]openAIToolCall, bool) {
 	if calls, ok := parseDSMLToolCalls(text); ok {
 		return calls, true
 	}
+	if calls, ok := parseGLMToolCalls(text); ok {
+		return calls, true
+	}
 	if calls, ok := parseBrokenCallToolCalls(text); ok {
 		return calls, true
 	}
@@ -1387,6 +1536,40 @@ func parseDSMLToolCalls(text string) ([]openAIToolCall, bool) {
 			}
 		}
 		call, ok := normalizeToolCall(map[string]any{"name": invoke[1], "arguments": args}, i)
+		if !ok {
+			return nil, false
+		}
+		calls = append(calls, call)
+	}
+	return calls, true
+}
+
+// GLM's native syntax, which it falls back to despite the JSON instruction:
+// <tool_call>Read<arg_key>file_path</arg_key><arg_value>/a</arg_value></tool_call>
+var (
+	glmToolCall = regexp.MustCompile(`(?s)<tool_call>\s*([^\s<>{}"]+)\s*((?:<arg_key>.*?</arg_key>\s*<arg_value>.*?</arg_value>\s*)*)</tool_call>`)
+	glmArgument = regexp.MustCompile(`(?s)<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>(.*?)</arg_value>`)
+)
+
+func parseGLMToolCalls(text string) ([]openAIToolCall, bool) {
+	blocks := glmToolCall.FindAllStringSubmatch(text, -1)
+	if len(blocks) == 0 {
+		return nil, false
+	}
+	calls := make([]openAIToolCall, 0, len(blocks))
+	for i, block := range blocks {
+		args := make(map[string]any)
+		for _, arg := range glmArgument.FindAllStringSubmatch(block[2], -1) {
+			args[arg[1]] = arg[2]
+			// Numbers, booleans, lists and objects arrive as JSON; text stays as written.
+			var value any
+			if trimmed := strings.TrimSpace(arg[2]); json.Unmarshal([]byte(trimmed), &value) == nil {
+				if _, isString := value.(string); !isString {
+					args[arg[1]] = value
+				}
+			}
+		}
+		call, ok := normalizeToolCall(map[string]any{"name": block[1], "arguments": args}, i)
 		if !ok {
 			return nil, false
 		}

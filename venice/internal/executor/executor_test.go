@@ -641,24 +641,48 @@ func TestExecuteRepairsCutToolCall(t *testing.T) {
 	}
 }
 
-func TestExecuteKeepsAnswerWhenRepairFails(t *testing.T) {
-	client := &queuedClient{bodies: []string{cutLeadIn, cutLeadIn}}
-	resp, err := NewExecutor().Execute(context.Background(), pluginapi.ExecutorRequest{
+// A lead-in whose call stays lost must not end the client's turn as an answer:
+// two repair rounds, then an error the client reports and retries.
+func TestExecuteFailsWhenRepairRoundsFail(t *testing.T) {
+	client := &queuedClient{bodies: []string{cutLeadIn, cutLeadIn, cutLeadIn}}
+	_, err := NewExecutor().Execute(context.Background(), pluginapi.ExecutorRequest{
 		Model: "m", Payload: []byte(toolPayload), StorageJSON: []byte(freshStorage), HTTPClient: client,
 	})
-	if err != nil {
-		t.Fatalf("Execute error: %v", err)
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != 502 || !strings.Contains(err.Error(), "cut off the tool call") {
+		t.Fatalf("err = %v, want a 502 naming the lost call", err)
 	}
-	if len(client.requests) != 2 {
-		t.Fatalf("requests = %d, want exactly one repair", len(client.requests))
+	if len(client.requests) != 3 {
+		t.Fatalf("requests = %d, want two repair rounds", len(client.requests))
 	}
-	var body map[string]any
-	if err := json.Unmarshal(resp.Payload, &body); err != nil {
-		t.Fatalf("decode output: %v", err)
+	if !strings.Contains(string(client.requests[2]), "announced a step") {
+		t.Fatal("the second repair round must name the announced step")
 	}
-	message := body["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
-	if message["content"] != "Ich prüfe zuerst den Ordner:" {
-		t.Fatalf("content = %#v, want the original answer", message["content"])
+}
+
+func TestSecondRepairRoundRescuesTheCall(t *testing.T) {
+	rounds := 0
+	ask := func(context.Context, string, string) (string, bool) {
+		rounds++
+		if rounds == 1 {
+			return "Ich lese jetzt die Datei:", true
+		}
+		return `{"tool_calls":[{"name":"list_files","arguments":{}}]}`, true
+	}
+	req := openAIRequest{Tools: []json.RawMessage{json.RawMessage(`{"type":"function","function":{"name":"list_files"}}`)}}
+	content, err := repairAnswer(context.Background(), req, "Dann wende ich alle Patches an:", "", ask)
+	if _, ok := toolCallsFor(req, content); err != nil || !ok || rounds != 2 {
+		t.Fatalf("content = %q, rounds = %d (%v)", content, rounds, err)
+	}
+	// The stream ends in an error, never in a "stop" after the lead-in.
+	lost := func(context.Context, string, string) (string, bool) { return "Gleich:", true }
+	joined, err := streamOf(t, req, lost, `{"kind":"content","content":"Dann wende ich alle Patches an:"}`+"\n")
+	if err == nil || strings.Contains(joined, `"finish_reason":"stop"`) {
+		t.Fatalf("stream = %s (%v), want an error instead of a silent end", joined, err)
+	}
+	// A real answer without a call stays an answer.
+	if content, err := repairAnswer(context.Background(), req, "Fertig, alles angewendet.", "", lost); err != nil || content != "Fertig, alles angewendet." {
+		t.Fatalf("answer = %q (%v)", content, err)
 	}
 }
 
@@ -778,5 +802,105 @@ func TestCallToolParamsReachOpenWebUIAsValidJSON(t *testing.T) {
 		if !ok || calls[0].Function.Name != "call_tool" || !strings.Contains(calls[0].Function.Arguments, `"params":"{\"command\":\"ls\"}"`) {
 			t.Errorf("%s: calls = %#v", text, calls)
 		}
+	}
+}
+
+// streamOf feeds the stream converter with raw reads, as the host passes them.
+func streamOf(t *testing.T, req openAIRequest, ask func(context.Context, string, string) (string, bool), reads ...string) (string, error) {
+	t.Helper()
+	in := make(chan pluginapi.HTTPStreamChunk, len(reads))
+	for _, read := range reads {
+		in <- pluginapi.HTTPStreamChunk{Payload: []byte(read)}
+	}
+	close(in)
+	var frames []string
+	var errStream error
+	for chunk := range openAIStreamChunksWithMonitor(context.Background(), in, "m", req, nil, ask) {
+		if chunk.Err != nil {
+			errStream = chunk.Err
+			continue
+		}
+		frames = append(frames, string(chunk.Payload))
+	}
+	return strings.Join(frames, "\n"), errStream
+}
+
+func TestStreamJoinsLinesSplitAcrossReads(t *testing.T) {
+	line := `{"kind":"content","content":"{\"tool_calls\":[{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/a\"}}]}"}` + "\n"
+	// Split inside the JSON line, then a last line without a newline at all.
+	joined, err := streamOf(t, claudeCodeTools, nil, `{"kind":"content","reasoning_content":"ok"}`+"\n"+line[:25], line[25:60], line[60:], `{"kind":"content","content":""}`)
+	if err != nil || !strings.Contains(joined, `"name":"Read"`) || !strings.Contains(joined, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("stream = %s (%v), want the call from the split line", joined, err)
+	}
+	plain, err := streamOf(t, openAIRequest{}, nil, `{"kind":"content","content":"Hal`, `lo"}`)
+	if err != nil || !strings.Contains(plain, `"content":"Hallo"`) {
+		t.Fatalf("plain stream = %s (%v), want the last line without newline", plain, err)
+	}
+}
+
+func TestToolCallInReasoningBecomesTheCall(t *testing.T) {
+	cases := map[string]string{
+		"json":       `Ich könnte {"tool_calls":[{"name":"Read","arguments":{"file_path":"/alt"}}]} nehmen, besser: {"tool_calls":[{"name":"Read","arguments":{"file_path":"/a"}}]}`,
+		"glm native": "Erst lesen.\n<tool_call>Read<arg_key>file_path</arg_key><arg_value>/a</arg_value></tool_call>",
+	}
+	for name, reasoning := range cases {
+		content, err := repairAnswer(context.Background(), claudeCodeTools, "", reasoning, nil)
+		calls, ok := toolCallsFor(claudeCodeTools, content)
+		if err != nil || !ok || len(calls) != 1 || calls[0].Function.Arguments != `{"file_path":"/a"}` {
+			t.Errorf("%s: content = %q, calls = %#v (%v)", name, content, calls, err)
+		}
+	}
+	// A real answer stays, even when the reasoning considered a call.
+	content, err := repairAnswer(context.Background(), claudeCodeTools, "Die Datei ist leer.", cases["json"], nil)
+	if err != nil || content != "Die Datei ist leer." {
+		t.Fatalf("answer = %q (%v)", content, err)
+	}
+	// Reasoning that only mentions a tool not offered is no call.
+	if _, ok := callsInReasoning(claudeCodeTools, `{"tool_calls":[{"name":"Bash","arguments":{}}]}`); ok {
+		t.Fatal("a call to a tool that is not offered must not come from reasoning")
+	}
+	// The stream, too: content empty, the call in the reasoning.
+	joined, err := streamOf(t, claudeCodeTools, nil, `{"kind":"content","reasoning_content":"`+strings.ReplaceAll(cases["glm native"], "\n", `\n`)+`"}`+"\n")
+	if err != nil || !strings.Contains(joined, `"name":"Read"`) {
+		t.Fatalf("stream = %s (%v)", joined, err)
+	}
+}
+
+func TestParseGLMNativeToolCalls(t *testing.T) {
+	text := "<tool_call>Bash\n<arg_key>command</arg_key>\n<arg_value>ls -la \"a b\"</arg_value>\n<arg_key>timeout</arg_key>\n<arg_value>30</arg_value>\n</tool_call>\n<tool_call>TodoRead\n</tool_call>"
+	calls, ok := parseToolCalls(text)
+	if !ok || len(calls) != 2 || calls[0].Function.Name != "Bash" || calls[0].Function.Arguments != `{"command":"ls -la \"a b\"","timeout":30}` || calls[1].Function.Arguments != `{}` {
+		t.Fatalf("calls = %#v, ok = %v", calls, ok)
+	}
+}
+
+func TestEmptyAnswerIsAnError(t *testing.T) {
+	// Execute: answer and repair round stay empty; the error names Venice's reason.
+	client := &queuedClient{bodies: []string{
+		`{"kind":"content","reasoning_content":"Hmm."}` + "\n" + `{"kind":"error","error":"daily limit reached"}`,
+		`{"kind":"content","content":""}`,
+		`{"kind":"content","content":""}`,
+	}}
+	_, err := NewExecutor().Execute(context.Background(), pluginapi.ExecutorRequest{
+		Model: "m", Payload: []byte(toolPayload), StorageJSON: []byte(freshStorage), HTTPClient: client,
+	})
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != 502 || !strings.Contains(err.Error(), "daily limit reached") {
+		t.Fatalf("err = %v, want a 502 with Venice's reason", err)
+	}
+	// The repair round asks without reasoning, so the call lands in the content.
+	var retry map[string]any
+	if json.Unmarshal(client.requests[1], &retry) != nil || retry["reasoning"] != false {
+		t.Fatalf("repair request reasoning = %v, want false", retry["reasoning"])
+	}
+	// Stream: thinking went out, then the error instead of a silent end.
+	empty := func(context.Context, string, string) (string, bool) { return "", true }
+	joined, err := streamOf(t, claudeCodeTools, empty, `{"kind":"content","reasoning_content":"Hmm."}`+"\n")
+	if err == nil || !strings.Contains(joined, "Hmm.") || strings.Contains(joined, `"finish_reason":"stop"`) {
+		t.Fatalf("stream = %s (%v), want thinking, then an error", joined, err)
+	}
+	// Without tools an empty answer is not this plugin's to judge.
+	if _, err := streamOf(t, openAIRequest{}, nil, `{"kind":"content","reasoning_content":"Hmm."}`+"\n"); err != nil {
+		t.Fatalf("plain chat: %v", err)
 	}
 }
